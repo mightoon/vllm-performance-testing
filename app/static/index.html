@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM 测试平台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">LLM 测试平台</div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="text">文本测试</button>
+    <button class="tab" data-tab="image">图形测试</button>
+    <button class="tab" data-tab="mixed">综合测试</button>
+  </nav>
+  <button class="btn-settings" id="btnSettings">⚙ 设置</button>
+</header>
+
+<main class="content">
+
+  <!-- ============ 文本测试 Tab ============ -->
+  <section class="tab-panel active" id="panel-text">
+    <div class="param-card">
+      <h3>测试参数</h3>
+      <div class="param-grid">
+        <div class="param-item">
+          <label>模型配置</label>
+          <select id="textModelSelect"></select>
+        </div>
+        <div class="param-item">
+          <label>名词数量（每Thread迭代次数）</label>
+          <input type="number" id="nounCount" value="5" min="1" max="100">
+        </div>
+        <div class="param-item">
+          <label>文章篇幅（字）</label>
+          <input type="number" id="articleLength" value="500" min="50" max="10000" step="50">
+        </div>
+        <div class="param-item">
+          <label>并发度（并行 Thread 数）</label>
+          <input type="number" id="concurrency" value="2" min="1" max="1000">
+        </div>
+      </div>
+      <div class="param-actions">
+        <button class="btn-primary" id="btnRunText">▶ 运行测试</button>
+        <button class="btn-danger" id="btnStopText" disabled>■ 停止</button>
+      </div>
+    </div>
+
+    <!-- ============ 测试运行显示区域（隶属于文本测试 tab） ============ -->
+    <section class="run-area" id="runArea">
+      <div class="run-area-header">
+        <h3>测试运行状态</h3>
+        <div class="refresh-control">
+          <label>刷新间隔</label>
+          <select id="refreshInterval">
+            <option value="1">1 秒</option>
+            <option value="3">3 秒</option>
+            <option value="5">5 秒</option>
+            <option value="10" selected>10 秒</option>
+            <option value="30">30 秒</option>
+            <option value="custom">自定义</option>
+          </select>
+          <input type="number" id="customInterval" min="1" max="3600"
+                 placeholder="秒" style="display:none">
+        </div>
+      </div>
+      <div class="run-summary" id="runSummary" style="display:none">
+        <span id="sumStatus"></span>
+        <span id="sumElapsed"></span>
+        <span id="sumCalls"></span>
+        <span id="sumErrors"></span>
+        <span id="sumChars"></span>
+      </div>
+      <!-- vLLM 服务端指标条（全局，不区分 case；随状态轮询刷新，不低于 15s 一次） -->
+      <div class="vllm-bar" id="vllmBar" style="display:none">
+        <div class="vllm-bar-title">vLLM 指标</div>
+        <div class="detail-grid vllm-grid" id="vllmBarItems"></div>
+      </div>
+      <div class="progress-list" id="progressList">
+        <div class="run-empty" id="runEmpty">暂无运行中的测试</div>
+      </div>
+    </section>
+  </section>
+
+  <!-- ============ 图形测试 Tab（占位） ============ -->
+  <section class="tab-panel" id="panel-image">
+    <div class="placeholder-card">
+      <div class="placeholder-icon">🖼️</div>
+      <h3>图形测试</h3>
+      <p>该测试模块正在建设中，敬请期待。</p>
+    </div>
+  </section>
+
+  <!-- ============ 综合测试 Tab（占位） ============ -->
+  <section class="tab-panel" id="panel-mixed">
+    <div class="placeholder-card">
+      <div class="placeholder-icon">🧩</div>
+      <h3>综合测试</h3>
+      <p>该测试模块正在建设中，敬请期待。</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============ 模型配置弹窗 ============ -->
+<div class="modal-overlay" id="settingsModal" style="display:none">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>大模型配置</h3>
+      <button class="btn-close" id="btnCloseSettings">×</button>
+    </div>
+
+    <div class="modal-body">
+      <!-- 已存储配置列表 -->
+      <div class="section-title">已存储的配置</div>
+      <div class="manage-list" id="modelList">
+        <div class="manage-empty">暂无配置</div>
+      </div>
+
+      <hr class="divider">
+
+      <!-- 添加 / 编辑表单 -->
+      <div class="section-title" id="formTitle">添加配置</div>
+      <form id="modelForm" class="model-form">
+        <input type="hidden" id="editModelId">
+        <div class="form-row">
+          <label>模型名称 <em>*</em></label>
+          <input type="text" id="fName" placeholder="如：我的 DeepSeek" autocomplete="off">
+        </div>
+        <div class="form-row">
+          <label>模型 ID <em>*</em></label>
+          <input type="text" id="fModel" placeholder="如：deepseek-chat / qwen35-35b" autocomplete="off">
+        </div>
+        <div class="form-row">
+          <label>Base URL <em>*</em></label>
+          <input type="text" id="fUrl" placeholder="如：https://api.deepseek.com/v1" autocomplete="off">
+        </div>
+        <div class="form-row">
+          <label>API Key（可选）</label>
+          <input type="password" id="fKey" placeholder="部分本地模型无需填写" autocomplete="off">
+        </div>
+        <div class="form-actions">
+          <span class="verify-status" id="verifyStatus"></span>
+          <button type="button" class="btn-verify" id="btnVerify">测试连接</button>
+          <button type="button" class="btn-secondary" id="btnResetForm">返回</button>
+          <button type="button" class="btn-primary" id="btnSaveModel" disabled>保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Case 详情弹窗 ============ -->
+<div class="modal-overlay" id="caseModal" style="display:none">
+  <div class="modal case-detail-card">
+    <div class="modal-header">
+      <h3 id="caseDetailTitle">Thread 详情</h3>
+      <span class="case-status" id="caseDetailBadge"></span>
+      <button class="btn-close" id="btnCloseCase">✕</button>
+    </div>
+    <div class="case-detail-body">
+      <div class="detail-section">
+        <h4>运行数据</h4>
+        <div class="detail-grid" id="caseRunStats"></div>
+      </div>
+      <div class="detail-section">
+        <h4>端到端性能 <span class="detail-hint">（客户端测量 · 仅统计流式文章调用 · 10s 刷新）</span></h4>
+        <div class="detail-grid" id="caseE2eMetrics"></div>
+      </div>
+      <div class="detail-section">
+        <a href="javascript:void(0)" class="detail-toggle" id="btnMoreDetail">更多细节 ▸</a>
+        <div class="qa-layout" id="caseQaWrap" style="display:none">
+          <div class="qa-outline" id="caseQaOutline"></div>
+          <div class="qa-list" id="caseQaList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/marked.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
