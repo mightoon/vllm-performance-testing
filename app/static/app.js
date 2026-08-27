@@ -39,8 +39,10 @@ let editSnapshot = null;     // 编辑模式初始值快照
 
 function openSettings() {
   settingsModal.style.display = "flex";
+  switchSettingsTab("models");
   loadModelList();
   loadModelSelect();
+  loadPromConfig();
 }
 function closeSettings() {
   settingsModal.style.display = "none";
@@ -50,6 +52,58 @@ $("btnSettings").addEventListener("click", openSettings);
 $("btnCloseSettings").addEventListener("click", closeSettings);
 settingsModal.addEventListener("click", (e) => {
   if (e.target === settingsModal) closeSettings();
+});
+
+/* ---- 设置弹窗 tab 切换（大模型配置 / Prometheus） ---- */
+function switchSettingsTab(which) {
+  document.querySelectorAll(".settings-tab").forEach((b) =>
+    b.classList.toggle("active", b.id === (which === "prom" ? "settingsTabBtnProm" : "settingsTabBtnModels")));
+  $("settingsTabModels").classList.toggle("active", which !== "prom");
+  $("settingsTabProm").classList.toggle("active", which === "prom");
+}
+$("settingsTabBtnModels").addEventListener("click", () => switchSettingsTab("models"));
+$("settingsTabBtnProm").addEventListener("click", () => switchSettingsTab("prom"));
+
+/* ---- Prometheus 配置表单 ---- */
+async function loadPromConfig() {
+  const r = await fetchJSON("/api/prometheus/config");
+  if (r && r.success) {
+    $("promUrl").value = (r.config && r.config.url) || "";
+    $("promGrafanaUrl").value = (r.config && r.config.grafana_url) || "";
+  }
+}
+
+$("btnPromTest").addEventListener("click", async () => {
+  const url = $("promUrl").value.trim();
+  const st = $("promStatus");
+  if (!url) { st.textContent = "请先填写 URL"; st.style.color = "var(--danger)"; return; }
+  st.textContent = "连接中…"; st.style.color = "var(--text-sub)";
+  const r = await fetchJSON("/api/prometheus/test", {
+    method: "POST", body: JSON.stringify({ url, grafana_url: "" }),
+  });
+  if (r && r.success) {
+    st.textContent = "连接成功"; st.style.color = "var(--success, #16a34a)";
+  } else {
+    st.textContent = "连接失败: " + ((r && r.error) || "未知错误");
+    st.style.color = "var(--danger)";
+  }
+});
+
+$("btnPromSave").addEventListener("click", async () => {
+  const url = $("promUrl").value.trim();
+  const grafana = $("promGrafanaUrl").value.trim();
+  const st = $("promStatus");
+  if (!url) { st.textContent = "Prometheus URL 不能为空"; st.style.color = "var(--danger)"; return; }
+  const r = await fetchJSON("/api/prometheus/config", {
+    method: "PUT",
+    body: JSON.stringify({ url, grafana_url: grafana }),
+  });
+  if (r && r.success) {
+    st.textContent = "已保存"; st.style.color = "var(--success, #16a34a)";
+  } else {
+    st.textContent = "保存失败: " + ((r && r.error) || "未知错误");
+    st.style.color = "var(--danger)";
+  }
 });
 
 /* ---- 配置列表 ---- */
@@ -294,25 +348,210 @@ function renderHistoryList() {
   list.innerHTML = html || '<div class="history-empty">暂无历史测试</div>';
 }
 
+/* 面板标题随模式切换：参数区恒为“测试场景”，状态区 run=测试状态 / report=测试报告 */
+function setPanelTitles(mode) {
+  $("paramPanelTitle").textContent = "测试场景";
+  $("runPanelTitle").textContent = mode === "report" ? "测试报告" : "测试状态";
+}
+
 /* 进入运行测试模式：恢复 thread 列表显示与轮询 */
 function enterRunMode() {
   textMode = "run";
   textActiveTask = null;
+  setPanelTitles("run");
+  $("btnGenReport").style.display = "none";   // 运行模式隐藏，终态时由 renderStatus 显示
+  hideMonitor();   // 监控图表仅报告模式显示
   $("progressList").style.display = "";
   restartPolling();
   renderHistoryList();
 }
+
+/* ============ 报告模式监控图表（Prometheus 快照） ============ */
+let monitorChartInstances = [];
+
+function disposeMonitorCharts() {
+  monitorChartInstances.forEach((c) => c.dispose());
+  monitorChartInstances = [];
+}
+
+function hideMonitor() {
+  disposeMonitorCharts();
+  $("monitorArea").style.display = "none";
+}
+
+/* 加载监控数据：快照优先 → 实时查询兜底 → 无数据占位 */
+async function loadMonitorCharts(taskName, config, result) {
+  disposeMonitorCharts();
+  const area = $("monitorArea");
+  area.style.display = "block";
+  $("monitorCards").innerHTML = "";
+  $("monitorCharts").innerHTML = "";
+  $("monitorEmpty").style.display = "none";
+  $("monitorSource").textContent = "";
+  updateGrafanaLink(config, result);
+
+  const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}/metrics`);
+  if (!r || !r.success || !r.metrics || !(r.metrics.series || []).length) {
+    $("monitorEmpty").style.display = "block";
+    return;
+  }
+  $("monitorSource").textContent = r.source === "live" ? "（实时查询）" : "";
+  renderMonitorCharts(r.metrics);
+}
+
+/* Grafana 跳转链接（配置了 Grafana URL 时显示，带测试起止时间） */
+async function updateGrafanaLink(config, result) {
+  const link = $("grafanaLink");
+  link.style.display = "none";
+  try {
+    const r = await fetchJSON("/api/prometheus/config");
+    const base = r && r.config && r.config.grafana_url;
+    if (!base) return;
+    const started = (config && config.started_at) || 0;
+    const elapsed = (result && result.elapsed) || 0;
+    if (!started || !elapsed) return;
+    const from = Math.round(started * 1000);
+    const to = Math.round((started + elapsed) * 1000);
+    // base 为 dashboard 地址（如 http://host:3000/d/<uid>/<slug>），拼时间范围参数
+    const sep = base.includes("?") ? "&" : "?";
+    link.href = base.replace(/\/+$/, "") + `${sep}from=${from}&to=${to}`;
+    link.style.display = "";
+  } catch (e) { /* 链接生成失败不影响图表 */ }
+}
+
+/* 渲染统计卡片 + 分组折线图 */
+const MONITOR_GROUP_TITLES = {
+  concurrency: "并发与排队",
+  cache: "KV cache 使用率",
+  latency: "首 token 延迟（TTFT）",
+  throughput: "生成吞吐",
+};
+const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "throughput"];
+
+function renderMonitorCharts(metrics) {
+  const fmt = (v) => v == null ? "—" :
+    v.toLocaleString(undefined, { maximumFractionDigits: 1 });
+
+  // 统计卡片（后端预计算）
+  const stats = metrics.stats || {};
+  const cards = [
+    ["平均生成吞吐", fmt(stats.gen_throughput_avg), "tok/s"],
+    ["峰值生成吞吐", fmt(stats.gen_throughput_peak), "tok/s"],
+    ["平均 TTFT p50", fmt(stats.ttft_p50_avg_ms), "ms"],
+    ["峰值 TTFT p95", fmt(stats.ttft_p95_peak_ms), "ms"],
+    ["KV cache 峰值", fmt(stats.kv_cache_peak_perc), "%"],
+  ];
+  $("monitorCards").innerHTML = cards.map(([label, val, unit]) =>
+    `<div class="monitor-card">
+       <div class="monitor-card-val">${val}<span class="monitor-card-unit">${unit}</span></div>
+       <div class="monitor-card-label">${label}</div>
+     </div>`).join("");
+
+  // 分组折线图（同 group 画同一张图）
+  const groups = {};
+  (metrics.series || []).forEach((s) => {
+    (groups[s.group] = groups[s.group] || []).push(s);
+  });
+  const wrap = $("monitorCharts");
+  wrap.innerHTML = "";
+  const groupKeys = MONITOR_GROUP_ORDER.filter((g) => groups[g])
+    .concat(Object.keys(groups).filter((g) => !MONITOR_GROUP_ORDER.includes(g)));
+
+  // 第一步：先构建全部卡片 DOM（auto-fit 网格需所有卡片就位后才能确定列宽），
+  // 暂不 init 图表，避免首图按整行宽度初始化导致溢出重叠
+  const pending = [];
+  groupKeys.forEach((g) => {
+    const seriesList = groups[g];
+    const card = document.createElement("div");
+    card.className = "monitor-chart-card";
+    const title = document.createElement("div");
+    title.className = "monitor-chart-title";
+    title.textContent = MONITOR_GROUP_TITLES[g] || g;
+    const chartEl = document.createElement("div");
+    chartEl.className = "monitor-chart";
+    card.appendChild(title);
+    card.appendChild(chartEl);
+    wrap.appendChild(card);
+
+    // 数据变换：时间戳 s → ms（ECharts time 轴用毫秒）；
+    // cache 组 0-1 → 百分比；latency 组 s → ms
+    const transform = (s) => {
+      let data = (s.data || []).map(([t, v]) => [t * 1000, v]);
+      if (s.group === "cache") data = data.map(([t, v]) => [t, +(v * 100).toFixed(2)]);
+      if (s.group === "latency") data = data.map(([t, v]) => [t, +(v * 1000).toFixed(1)]);
+      return data;
+    };
+    const unit = seriesList[0].unit === "%" ? "%" :
+      (g === "latency" ? "ms" : seriesList[0].unit);
+
+    pending.push({
+      el: chartEl,
+      option: {
+        animation: false,
+        tooltip: {
+          trigger: "axis",
+          axisPointer: { type: "cross" },
+          valueFormatter: (v) => v == null ? "—" : `${(+v).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`,
+        },
+        legend: seriesList.length > 1 ? { bottom: 0, icon: "rect", itemWidth: 14, itemHeight: 4 } : undefined,
+        // 底部留白统一 56px：有图例时时间轴上移避开图例，无图例时同高对齐
+        grid: { left: 56, right: 24, top: 32, bottom: 56 },
+        xAxis: {
+          type: "time",
+          axisLabel: { hideOverlap: true, formatter: "{HH}:{mm}:{ss}" },
+        },
+        yAxis: {
+          type: "value",
+          name: unit,
+          nameGap: 10,
+          nameTextStyle: { color: "#94a3b8", fontSize: 11 },
+          scale: g !== "cache",
+          max: g === "cache" ? 100 : undefined,
+          axisLabel: {
+            formatter: (v) => v >= 10000 ? (v / 1000) + "k" : v,
+          },
+        },
+        series: seriesList.map((s) => ({
+          name: s.legend,
+          type: "line",
+          showSymbol: false,
+          data: transform(s),
+          lineStyle: { width: 1.6 },
+          emphasis: { focus: "series" },
+        })),
+      },
+    });
+  });
+
+  // 第二步：布局稳定后再初始化图表（canvas 尺寸与卡片一致）
+  requestAnimationFrame(() => {
+    pending.forEach(({ el, option }) => {
+      if (!el.isConnected) return;  // DOM 已被重建（快速切换任务）则跳过
+      const chart = echarts.init(el);
+      monitorChartInstances.push(chart);
+      chart.setOption(option);
+      chart.resize();
+    });
+  });
+}
+
+window.addEventListener("resize", () => {
+  monitorChartInstances.forEach((c) => c.resize());
+});
 
 /* 进入展示报告模式：停止轮询，用持久化数据填充参数与指标 */
 async function enterReportMode(taskName) {
   textMode = "report";
   textActiveTask = taskName;
   textDraftTask = null;
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  setPanelTitles("report");
+  $("btnGenReport").style.display = "none";   // 已在报告页，无需该入口
+  // 不停止轮询：报告模式下 pollStatus 仅跟踪后台测试是否结束（刷新侧栏状态），不触碰报告显示
   closeCaseModal();
   const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}`);
   if (!r || !r.success) return alert((r && r.error) || "加载历史任务失败");
   renderReport(r.config || {}, r.result || {});
+  loadMonitorCharts(taskName, r.config || {}, r.result || {});
   renderHistoryList();
 }
 
@@ -351,14 +590,24 @@ function renderReport(config, result) {
   setRunningUI(false);
 }
 
-/* 侧栏点击：草稿项→运行模式；历史任务→报告模式 */
+/* 侧栏点击：草稿项→运行模式；运行中任务→回到实时监控；已结束任务→报告模式 */
 $("textHistoryList").addEventListener("click", (e) => {
   const item = e.target.closest(".history-item");
   if (!item) return;
   if (textMode === "run" && item.dataset.name === textDraftTask) {
     return;   // 草稿已处于运行模式
   }
-  enterReportMode(item.dataset.name);
+  const name = item.dataset.name;
+  const task = lastHistoryTasks.find((t) => t.name === name);
+  if (task && task.status === "running") {
+    // 正在运行的任务：回到运行模式恢复实时刷新（放弃未启动的草稿，表单参数保留）
+    textDraftTask = null;
+    textCurrentTask = name;   // 先行对齐侧栏高亮，pollStatus 随后以权威数据校正
+    enterRunMode();
+    pollStatus();   // 立即刷新一次，不等首个轮询周期
+    return;
+  }
+  enterReportMode(name);
 });
 
 /* 新测试：进入运行模式，侧栏生成草稿任务，参数区留空待填写 */
@@ -366,6 +615,7 @@ $("btnNewTextTest").addEventListener("click", () => {
   textDraftTask = genTaskName();
   textMode = "run";
   textActiveTask = null;
+  setPanelTitles("run");
   textCurrentTask = null;   // 清除最近任务，避免轮询回显旧结果、侧栏高亮旧任务
   // 参数区留空
   $("textModelSelect").value = "";
@@ -378,6 +628,8 @@ $("btnNewTextTest").addEventListener("click", () => {
   $("runSummary").style.display = "none";
   $("vllmBar").style.display = "none";
   $("runEmpty").style.display = "block";
+  $("btnGenReport").style.display = "none";   // 草稿模式隐藏"生成报告"入口
+  hideMonitor();   // 监控图表仅报告模式显示
   setRunningUI(false);
   restartPolling();
   renderHistoryList();
@@ -385,7 +637,7 @@ $("btnNewTextTest").addEventListener("click", () => {
 
 /* ============ 文本测试运行控制 ============ */
 let pollTimer = null;
-let currentInterval = 10;
+let currentInterval = 3;
 
 $("btnRunText").addEventListener("click", async () => {
   const modelId = $("textModelSelect").value;
@@ -405,6 +657,11 @@ $("btnRunText").addEventListener("click", async () => {
   textDraftTask = null;
   textCurrentTask = r.task_name || null;
   enterRunMode();
+  // 清掉上一任务残留的进度行与汇总（并发数变小时尤为明显），首次轮询返回前显示空态
+  $("progressList").querySelectorAll(".case-row").forEach((row) => row.remove());
+  $("runSummary").style.display = "none";
+  $("vllmBar").style.display = "none";
+  $("runEmpty").style.display = "block";
   setRunningUI(true);
   pollStatus(); // 立即刷新一次
   loadTextHistory(); // 侧栏顶部出现新任务
@@ -413,6 +670,11 @@ $("btnRunText").addEventListener("click", async () => {
 $("btnStopText").addEventListener("click", async () => {
   await fetchJSON("/api/tests/text/stop", { method: "POST" });
   pollStatus();
+});
+
+/* 一键生成报告：当前任务已结束，直接转入其报告页 */
+$("btnGenReport").addEventListener("click", () => {
+  if (textCurrentTask) enterReportMode(textCurrentTask);
 });
 
 function setRunningUI(running) {
@@ -425,7 +687,7 @@ $("refreshInterval").addEventListener("change", () => {
   const v = $("refreshInterval").value;
   if (v === "custom") {
     $("customInterval").style.display = "inline-block";
-    currentInterval = parseInt($("customInterval").value) || 10;
+    currentInterval = parseInt($("customInterval").value) || 3;
   } else {
     $("customInterval").style.display = "none";
     currentInterval = parseInt(v);
@@ -450,34 +712,35 @@ function restartPolling() {
 let lastVllmBarRender = 0;   // vLLM 指标条上次渲染时刻（节流，不低于 15s 一次）
 
 async function pollStatus() {
-  if (textMode !== "run") return;   // 报告模式：不轮询、不覆盖报告显示
-  // 草稿模式（已点"新测试"但尚未启动）：运行状态区保持清空，不回显上次测试结果
-  if (textDraftTask && !textCurrentTask) {
-    const s = await fetchJSON("/api/tests/text/status");
-    // 后台若有测试刚结束，仅刷新侧栏状态，不渲染结果区
-    if (s && s.test_id && lastTestStatus === "running" && s.status !== "running") {
+  const s = await fetchJSON("/api/tests/text/status");
+  if (s && s.test_id) {
+    // 测试刚结束（running → 终态）：result.json 已写入，刷新侧栏状态
+    // （报告模式同样需要：让侧栏"运行中"标记及时更新）
+    if (lastTestStatus === "running" && s.status !== "running") {
       loadTextHistory();
     }
-    if (s && s.test_id) lastTestStatus = s.status;
+    lastTestStatus = s.status;
+  }
+  if (textMode !== "run") return;   // 报告模式：仅跟踪后台测试状态，不覆盖报告显示
+  // 草稿模式（已点"新测试"但尚未启动）：运行状态区保持清空，不回显上次测试结果
+  if (textDraftTask && !textCurrentTask) {
+    $("btnGenReport").style.display = "none";
     return;
   }
-  const s = await fetchJSON("/api/tests/text/status");
   if (!s || !s.test_id) {
+    $("btnGenReport").style.display = "none";
     $("runEmpty").style.display = "block";
     $("vllmBar").style.display = "none";
     return;
   }
   if (s.task_name) textCurrentTask = s.task_name;
-  // 测试刚结束（running → 终态）：result.json 已写入，刷新侧栏状态
-  if (lastTestStatus === "running" && s.status !== "running") {
-    loadTextHistory();
-  }
-  lastTestStatus = s.status;
   renderStatus(s);
 }
 
 function renderStatus(s) {
   setRunningUI(s.status === "running");
+  // 测试到达终态：标题旁显示"生成报告"入口，一键转报告页
+  $("btnGenReport").style.display = (s.status !== "running" && textCurrentTask) ? "" : "none";
 
   // vLLM 指标条：随状态轮询刷新，但频率不低于 15s（数据由 status 接口顺带返回，无额外请求）
   const now = Date.now();
@@ -500,6 +763,8 @@ function renderStatus(s) {
   const list = $("progressList");
   $("runEmpty").style.display = "none";
   const rows = list.querySelectorAll(".case-row");
+  // 本次 case 数比上次少时，移除残留旧行（如上次 10 并发、本次 2 并发）
+  rows.forEach((row, i) => { if (i >= s.cases.length) row.remove(); });
   s.cases.forEach((c, i) => {
     let row = rows[i];
     if (!row) {

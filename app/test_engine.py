@@ -12,6 +12,7 @@ from typing import Optional
 from . import model_store
 from .llm_client import chat_completion_stream, fetch_vllm_metrics
 from .noun_library import pick_nouns_pool
+from . import prom_snapshot
 from . import workspace
 
 # 单个 case 的状态
@@ -307,6 +308,24 @@ class TextTestEngine:
                 workspace.save_result(self.task_name, result)
             except OSError:
                 pass  # 磁盘写入失败不影响测试本身
+        # 监控快照：后台拉取 Prometheus 指标存档（不阻塞结束流程；
+        # 未配置 Prometheus 或拉取失败均静默，不影响测试结果）
+        if self.task_name and self.started_at and self.finished_at:
+            asyncio.create_task(self._snapshot_metrics())
+
+    async def _snapshot_metrics(self):
+        """测试结束后按起止时间拉取 Prometheus 指标快照。"""
+        try:
+            cfg = model_store.get_prometheus_config()
+            url = cfg.get("url", "")
+            if not url:
+                return
+            snap = await prom_snapshot.fetch_snapshot(
+                url, self.started_at, self.finished_at)
+            if snap.get("series"):
+                prom_snapshot.save_metrics(self.task_name, snap)
+        except Exception:
+            pass  # 快照失败不影响测试结果
 
     async def _poll_vllm_metrics(self):
         """后台每 5 秒抓取一次 vLLM /metrics 主要指标。失败时记录错误信息。"""

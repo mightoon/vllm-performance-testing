@@ -134,3 +134,23 @@ def delete_model(model_id: str) -> bool:
             return False
         _save_all(data)
     return True
+
+
+# ==================== Prometheus 配置 ====================
+
+def get_prometheus_config() -> dict:
+    """读取 Prometheus 配置（无配置时返回空 dict）。"""
+    with _lock:
+        return dict(_load_all().get("prometheus", {}))
+
+
+def save_prometheus_config(url: str, grafana_url: str = "") -> dict:
+    """保存 Prometheus 配置（与 models 键并存于同一 config.json）。"""
+    with _lock:
+        data = _load_all()
+        data["prometheus"] = {
+            "url": url.strip(),
+            "grafana_url": (grafana_url or "").strip(),
+        }
+        _save_all(data)
+        return dict(data["prometheus"])

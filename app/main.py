@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from . import model_store
+from . import prom_snapshot
 from . import workspace
 from .llm_client import verify_connection
 from .test_engine import text_engine
@@ -219,6 +220,63 @@ def api_text_history_detail(task_name: str):
     if task is None:
         return JSONResponse({"success": False, "error": "任务不存在"}, 404)
     return {"success": True, "config": task["config"], "result": task["result"]}
+
+
+# ==================== Prometheus 监控 ====================
+
+class PromConfigPayload(BaseModel):
+    url: str
+    grafana_url: Optional[str] = ""
+
+
+@app.get("/api/prometheus/config")
+def api_prom_config_get():
+    return {"success": True, "config": model_store.get_prometheus_config()}
+
+
+@app.put("/api/prometheus/config")
+def api_prom_config_put(payload: PromConfigPayload):
+    url = payload.url.strip()
+    if not url:
+        return JSONResponse({"success": False, "error": "Prometheus URL 不能为空"}, 400)
+    if not url.startswith(("http://", "https://")):
+        return JSONResponse({"success": False, "error": "URL 需以 http:// 或 https:// 开头"}, 400)
+    cfg = model_store.save_prometheus_config(url, payload.grafana_url or "")
+    return {"success": True, "config": cfg}
+
+
+@app.post("/api/prometheus/test")
+async def api_prom_test(payload: PromConfigPayload):
+    url = payload.url.strip()
+    if not url:
+        return JSONResponse({"success": False, "error": "URL 不能为空"}, 400)
+    return await prom_snapshot.test_connection(url)
+
+
+@app.get("/api/tests/text/history/{task_name}/metrics")
+async def api_text_history_metrics(task_name: str):
+    """报告模式监控数据。三级回退：快照 → 实时查询 → 空。"""
+    # 1. 快照优先（测试结束时存档，不受 TSDB 保留期限制）
+    snap = prom_snapshot.load_metrics(task_name)
+    if snap:
+        return {"success": True, "source": "snapshot", "metrics": snap}
+    # 2. 无快照但有 Prometheus 配置：按任务起止时间实时查询（15 天内有效）
+    url = model_store.get_prometheus_config().get("url", "")
+    if url:
+        task = workspace.load_task(task_name)
+        if task:
+            started = float(task["config"].get("started_at") or 0)
+            elapsed = float(task["result"].get("elapsed") or 0)
+            ended = started + elapsed
+            if started > 0 and ended > started:
+                try:
+                    snap = await prom_snapshot.fetch_snapshot(url, started, ended)
+                    if snap.get("series"):
+                        return {"success": True, "source": "live", "metrics": snap}
+                except Exception:
+                    pass  # 实时查询失败：走空数据兜底
+    # 3. 无监控数据
+    return {"success": True, "source": None, "metrics": None}
 
 
 # ==================== 静态页面 ====================
