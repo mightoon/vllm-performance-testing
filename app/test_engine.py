@@ -12,6 +12,7 @@ from typing import Optional
 from . import model_store
 from .llm_client import chat_completion_stream, fetch_vllm_metrics
 from .noun_library import pick_nouns_pool
+from . import workspace
 
 # 单个 case 的状态
 @dataclass
@@ -163,6 +164,7 @@ class TextTestEngine:
         self._metrics_task: Optional[asyncio.Task] = None
         self._token_baseline: dict = {}   # 本轮测试开始时的 counter 基线
         self._noun_pool: list = []        # 全局名词池（各 thread 取不重叠分片）
+        self.task_name: str = ""          # 本轮测试任务名（workspace 目录名）
 
     # ---------- 启动 / 停止 ----------
 
@@ -183,6 +185,7 @@ class TextTestEngine:
             "concurrency": concurrency,
         }
         self.test_id = f"txt-{int(time.time()*1000)}"
+        self.task_name = workspace.new_task_name("文本测试")
         self.cases = [CaseState(case_id=i + 1) for i in range(concurrency)]
         for c in self.cases:
             c.status = "queued"
@@ -209,7 +212,22 @@ class TextTestEngine:
         self.vllm_metrics = None
         self._token_baseline = {}
         self._metrics_task = loop.create_task(self._poll_vllm_metrics())
-        return {"success": True, "test_id": self.test_id}
+        # 持久化：启动即写 config（profile + 模型快照），结束后由 _wait_all 写 result
+        workspace.save_config(self.task_name, {
+            "task_name": self.task_name,
+            "kind": "文本测试",
+            "test_id": self.test_id,
+            "status": "running",
+            "started_at": self.started_at,
+            "params": self.params,
+            "model": {
+                "id": model_id,
+                "name": model.get("name", ""),
+                "model": model.get("model", ""),
+                "url": model.get("url", ""),
+            },
+        })
+        return {"success": True, "test_id": self.test_id, "task_name": self.task_name}
 
     def stop(self) -> dict:
         if self.status != "running":
@@ -254,6 +272,7 @@ class TextTestEngine:
             elapsed = 0.0
         return {
             "test_id": self.test_id,
+            "task_name": self.task_name,
             "status": self.status,
             "params": self.params,
             "elapsed": round(elapsed, 1),
@@ -280,6 +299,14 @@ class TextTestEngine:
         if self.status == "running":
             self.status = "completed"
             self.finished_at = time.time()
+        # 持久化：测试结束（完成/停止/出错）后写 result（含各 case 问答历史）
+        if self.task_name:
+            try:
+                result = self.status_dict()
+                result["cases"] = [self.case_detail(c.case_id) for c in self.cases]
+                workspace.save_result(self.task_name, result)
+            except OSError:
+                pass  # 磁盘写入失败不影响测试本身
 
     async def _poll_vllm_metrics(self):
         """后台每 5 秒抓取一次 vLLM /metrics 主要指标。失败时记录错误信息。"""

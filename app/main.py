@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from . import model_store
+from . import workspace
 from .llm_client import verify_connection
 from .test_engine import text_engine
 import os
@@ -203,6 +204,21 @@ async def api_text_case_stream(case_id: int):
 @app.post("/api/tests/text/stop")
 async def api_text_stop():
     return text_engine.stop()
+
+
+@app.get("/api/tests/text/history")
+def api_text_history():
+    """历史文本测试任务列表（按开始时间倒序）。"""
+    return {"success": True, "tasks": workspace.list_history("文本测试")}
+
+
+@app.get("/api/tests/text/history/{task_name}")
+def api_text_history_detail(task_name: str):
+    """单个历史任务的完整配置与结果（报告模式数据源）。"""
+    task = workspace.load_task(task_name)
+    if task is None:
+        return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    return {"success": True, "config": task["config"], "result": task["result"]}
 
 
 # ==================== 静态页面 ====================

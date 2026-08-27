@@ -226,6 +226,163 @@ async function loadModelSelect() {
   if (prev && (models || []).some((m) => m.id === prev)) sel.value = prev;
 }
 
+/* ============ 历史测试侧栏与模式管理 ============
+   两种模式：
+   - run    运行测试模式（原有实现：轮询实时状态）
+   - report 展示报告模式（点击侧栏历史任务，用持久化数据填充参数与指标） */
+let textMode = "run";          // "run" | "report"
+let textActiveTask = null;     // 报告模式下正在查看的任务名
+let textDraftTask = null;      // "新测试"草稿任务名（尚未启动）
+let textCurrentTask = null;    // 运行模式当前（或最近）任务名
+let lastHistoryTasks = [];     // 最近一次拉取的历史列表
+let lastTestStatus = null;     // 上次轮询到的测试状态（检测结束刷新侧栏）
+
+function genTaskName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `文本测试-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+function currentSelectedTask() {
+  if (textMode === "report") return textActiveTask;
+  return textCurrentTask || textDraftTask;
+}
+
+async function loadTextHistory() {
+  const r = await fetchJSON("/api/tests/text/history");
+  lastHistoryTasks = (r && r.tasks) || [];
+  renderHistoryList();
+}
+
+const HISTORY_STATUS_TEXT = {
+  completed: "已完成", stopped: "已停止", error: "出错",
+  running: "运行中", interrupted: "未完成", draft: "草稿",
+};
+
+function historyItemHtml(t, selected, isDraft) {
+  const p = t.params || {};
+  const st = isDraft ? "draft"
+    : t.has_result ? (t.status || "completed")
+    : t.status === "running" ? "running" : "interrupted";
+  const stText = HISTORY_STATUS_TEXT[st] || st;
+  let sub;
+  if (isDraft) {
+    sub = "待填写参数";
+  } else {
+    // 任务名已含时间戳，副标题只展示 profile 概要
+    sub = [p.concurrency != null && `${p.concurrency}并发`,
+           p.noun_count != null && `${p.noun_count}名词`,
+           p.article_length != null && `${p.article_length}字`]
+      .filter(Boolean).join(" · ");
+  }
+  return `<div class="history-item ${t.name === selected ? "active" : ""}" data-name="${escapeHtml(t.name)}">` +
+    `<div class="history-item-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>` +
+    `<div class="history-item-meta">` +
+    `<span class="history-item-status ${st}">${stText}</span>` +
+    `<span class="history-item-sub">${escapeHtml(sub)}</span></div></div>`;
+}
+
+function renderHistoryList() {
+  const list = $("textHistoryList");
+  const selected = currentSelectedTask();
+  let html = "";
+  if (textDraftTask) {
+    html += historyItemHtml({ name: textDraftTask, params: {} }, selected, true);
+  }
+  html += lastHistoryTasks.map((t) => historyItemHtml(t, selected, false)).join("");
+  list.innerHTML = html || '<div class="history-empty">暂无历史测试</div>';
+}
+
+/* 进入运行测试模式：恢复 thread 列表显示与轮询 */
+function enterRunMode() {
+  textMode = "run";
+  textActiveTask = null;
+  $("progressList").style.display = "";
+  restartPolling();
+  renderHistoryList();
+}
+
+/* 进入展示报告模式：停止轮询，用持久化数据填充参数与指标 */
+async function enterReportMode(taskName) {
+  textMode = "report";
+  textActiveTask = taskName;
+  textDraftTask = null;
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  closeCaseModal();
+  const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}`);
+  if (!r || !r.success) return alert((r && r.error) || "加载历史任务失败");
+  renderReport(r.config || {}, r.result || {});
+  renderHistoryList();
+}
+
+/* 报告渲染：参数 panel 填充当时 profile；指标区填充当时数值；隐藏 thread 列表 */
+function renderReport(config, result) {
+  const p = config.params || {};
+  // 模型下拉：若该模型配置已被删除，插入占位项以便显示与复用
+  const sel = $("textModelSelect");
+  if (p.model_id && ![...sel.options].some((o) => o.value === p.model_id)) {
+    const opt = document.createElement("option");
+    opt.value = p.model_id;
+    opt.textContent = (config.model && config.model.name) || p.model_name || p.model_id;
+    sel.appendChild(opt);
+  }
+  sel.value = p.model_id || "";
+  $("nounCount").value = p.noun_count ?? "";
+  $("articleLength").value = p.article_length ?? "";
+  $("concurrency").value = p.concurrency ?? "";
+
+  // 指标区：汇总 + vLLM 指标条
+  const sum = result.summary || {};
+  $("runEmpty").style.display = "none";
+  $("runSummary").style.display = "flex";
+  $("sumStatus").innerHTML = `状态: <b>${STATUS_TEXT[result.status] || result.status || "未完成"}</b>`;
+  $("sumElapsed").innerHTML = `用时: <b>${fmtElapsed(result.elapsed || 0)}</b>`;
+  $("sumCalls").innerHTML = `总调用: <b>${sum.total_calls ?? "—"}</b>`;
+  $("sumErrors").innerHTML = `错误: <b style="color:${sum.total_errors ? "var(--danger)" : "inherit"}">${sum.total_errors ?? "—"}</b>`;
+  $("sumChars").innerHTML = `生成字数: <b>${(sum.total_chars ?? 0).toLocaleString()}</b>`;
+  lastVllmBarRender = 0;   // 报告模式不受节流限制，立即渲染
+  renderVllmBar(result.vllm_metrics);
+
+  // 报告模式：移除 thread 进度条区域
+  $("progressList").style.display = "none";
+
+  // 按钮保留：可按相同 profile 再次运行
+  setRunningUI(false);
+}
+
+/* 侧栏点击：草稿项→运行模式；历史任务→报告模式 */
+$("textHistoryList").addEventListener("click", (e) => {
+  const item = e.target.closest(".history-item");
+  if (!item) return;
+  if (textMode === "run" && item.dataset.name === textDraftTask) {
+    return;   // 草稿已处于运行模式
+  }
+  enterReportMode(item.dataset.name);
+});
+
+/* 新测试：进入运行模式，侧栏生成草稿任务，参数区留空待填写 */
+$("btnNewTextTest").addEventListener("click", () => {
+  textDraftTask = genTaskName();
+  textMode = "run";
+  textActiveTask = null;
+  textCurrentTask = null;   // 清除最近任务，避免轮询回显旧结果、侧栏高亮旧任务
+  // 参数区留空
+  $("textModelSelect").value = "";
+  $("nounCount").value = "";
+  $("articleLength").value = "";
+  $("concurrency").value = "";
+  // 运行模式空状态：清空上次测试的 thread 进度行（注意 runEmpty 是 progressList 子元素，不能 innerHTML=""）
+  $("progressList").style.display = "";
+  $("progressList").querySelectorAll(".case-row").forEach((r) => r.remove());
+  $("runSummary").style.display = "none";
+  $("vllmBar").style.display = "none";
+  $("runEmpty").style.display = "block";
+  setRunningUI(false);
+  restartPolling();
+  renderHistoryList();
+});
+
 /* ============ 文本测试运行控制 ============ */
 let pollTimer = null;
 let currentInterval = 10;
@@ -244,9 +401,13 @@ $("btnRunText").addEventListener("click", async () => {
     body: JSON.stringify(payload),
   });
   if (!r.success) return alert(r.error || "启动失败");
+  // 草稿落地为真实任务（后端生成权威任务名），转入运行测试模式
+  textDraftTask = null;
+  textCurrentTask = r.task_name || null;
+  enterRunMode();
   setRunningUI(true);
   pollStatus(); // 立即刷新一次
-  restartPolling();
+  loadTextHistory(); // 侧栏顶部出现新任务
 });
 
 $("btnStopText").addEventListener("click", async () => {
@@ -289,12 +450,29 @@ function restartPolling() {
 let lastVllmBarRender = 0;   // vLLM 指标条上次渲染时刻（节流，不低于 15s 一次）
 
 async function pollStatus() {
+  if (textMode !== "run") return;   // 报告模式：不轮询、不覆盖报告显示
+  // 草稿模式（已点"新测试"但尚未启动）：运行状态区保持清空，不回显上次测试结果
+  if (textDraftTask && !textCurrentTask) {
+    const s = await fetchJSON("/api/tests/text/status");
+    // 后台若有测试刚结束，仅刷新侧栏状态，不渲染结果区
+    if (s && s.test_id && lastTestStatus === "running" && s.status !== "running") {
+      loadTextHistory();
+    }
+    if (s && s.test_id) lastTestStatus = s.status;
+    return;
+  }
   const s = await fetchJSON("/api/tests/text/status");
   if (!s || !s.test_id) {
     $("runEmpty").style.display = "block";
     $("vllmBar").style.display = "none";
     return;
   }
+  if (s.task_name) textCurrentTask = s.task_name;
+  // 测试刚结束（running → 终态）：result.json 已写入，刷新侧栏状态
+  if (lastTestStatus === "running" && s.status !== "running") {
+    loadTextHistory();
+  }
+  lastTestStatus = s.status;
   renderStatus(s);
 }
 
@@ -735,10 +913,14 @@ function fmtElapsed(sec) {
 /* ============ 初始化 ============ */
 (async function init() {
   await loadModelSelect();
-  // 页面加载时若测试在运行，恢复显示
+  await loadTextHistory();
+  // 页面加载时若测试在运行，恢复显示并选中侧栏对应任务
   const s = await fetchJSON("/api/tests/text/status");
   if (s && s.test_id && s.status !== "idle") {
+    textCurrentTask = s.task_name || null;
+    lastTestStatus = s.status;
     renderStatus(s);
+    renderHistoryList();
   }
   restartPolling();
 })();

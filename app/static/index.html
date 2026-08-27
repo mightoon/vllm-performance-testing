@@ -22,6 +22,19 @@
 
   <!-- ============ 文本测试 Tab ============ -->
   <section class="tab-panel active" id="panel-text">
+    <!-- 左侧：历史测试任务列表 -->
+    <aside class="history-sidebar">
+      <div class="history-header">
+        <span class="history-title">历史测试</span>
+        <button class="btn-new-test" id="btnNewTextTest" title="新建测试任务">＋ 新测试</button>
+      </div>
+      <div class="history-list" id="textHistoryList">
+        <div class="history-empty">暂无历史测试</div>
+      </div>
+    </aside>
+
+    <!-- 右侧：参数与运行状态（原有布局） -->
+    <div class="tab-main">
     <div class="param-card">
       <h3>测试参数</h3>
       <div class="param-grid">
@@ -82,6 +95,7 @@
         <div class="run-empty" id="runEmpty">暂无运行中的测试</div>
       </div>
     </section>
+    </div>
   </section>
 
   <!-- ============ 图形测试 Tab（占位） ============ -->

@@ -76,6 +76,117 @@ body {
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
+/* ============ 历史测试侧栏（tab 左边栏） ============ */
+/* 侧栏通过负外边距悬挂在内容容器左侧的空白处，
+   主区域（参数/状态 panel）保持与未加侧栏时相同的原始宽度 */
+#panel-text.active { display: flex; gap: 20px; align-items: flex-start; }
+
+.history-sidebar {
+  width: 210px;
+  flex-shrink: 0;
+  margin-left: -230px;   /* 拉入左侧空白：侧栏宽 210 + 间距 20 */
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 140px);
+  position: sticky;
+  top: 84px;
+}
+
+/* 视口较窄、左侧空白不足以容纳侧栏时，回退为占位布局（避免被裁切） */
+@media (max-width: 1491px) {
+  .history-sidebar { margin-left: 0; }
+}
+
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-title { font-size: 13px; font-weight: 600; color: var(--text-sub); }
+
+.btn-new-test {
+  border: 1px solid var(--primary);
+  background: rgba(80, 112, 255, 0.08);
+  color: var(--primary);
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-new-test:hover { background: rgba(80, 112, 255, 0.16); }
+
+.history-list { flex: 1; overflow-y: auto; padding: 6px; }
+
+.history-empty {
+  color: var(--text-sub);
+  font-size: 12px;
+  text-align: center;
+  padding: 24px 0;
+}
+
+.history-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  margin-bottom: 2px;
+}
+.history-item:hover { background: rgba(80, 112, 255, 0.06); }
+.history-item.active {
+  background: rgba(80, 112, 255, 0.1);
+  border-color: rgba(80, 112, 255, 0.35);
+}
+
+.history-item-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-sub);
+}
+
+.history-item-status {
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 16px;
+  background: #f1f2f6;
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+.history-item-status.completed { background: #e3f6e8; color: #1a7f37; }
+.history-item-status.stopped { background: #f1f2f6; color: var(--text-sub); }
+.history-item-status.error { background: #fde8e8; color: var(--danger); }
+.history-item-status.running { background: #e8f0ff; color: var(--primary); }
+.history-item-status.draft { background: #fff4e0; color: #b25e09; }
+
+.history-item-sub {
+  font-size: 11px;
+  color: var(--text-sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-main { flex: 1; min-width: 0; }
+
 /* ============ 参数卡片 ============ */
 .param-card {
   background: var(--card);
