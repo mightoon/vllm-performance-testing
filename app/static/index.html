@@ -44,11 +44,21 @@
           <select id="textModelSelect"></select>
         </div>
         <div class="param-item">
-          <label>名词数量（每Thread迭代次数）</label>
+          <label>输入长度</label>
+          <select id="inputLength">
+            <option value="tiny">极短（~10 token）</option>
+            <option value="short">短（~100 token）</option>
+            <option value="medium">中（~1k token）</option>
+            <option value="long">长（~8k token）</option>
+            <option value="xlong">超长（~16k token）</option>
+          </select>
+        </div>
+        <div class="param-item">
+          <label>迭代次数（每Thread）</label>
           <input type="number" id="nounCount" value="5" min="1" max="100">
         </div>
         <div class="param-item">
-          <label>文章篇幅（字）</label>
+          <label>输出长度（字）</label>
           <input type="number" id="articleLength" value="500" min="50" max="10000" step="50">
         </div>
         <div class="param-item">

@@ -82,9 +82,9 @@ body {
 #panel-text.active { display: flex; gap: 20px; align-items: flex-start; }
 
 .history-sidebar {
-  width: 210px;
+  width: 262.5px;          /* 原 210px 扩为 5/4 */
   flex-shrink: 0;
-  margin-left: -230px;   /* 拉入左侧空白：侧栏宽 210 + 间距 20 */
+  margin-left: -282.5px;   /* 拉入左侧空白：侧栏宽 262.5 + 间距 20 */
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -96,7 +96,7 @@ body {
 }
 
 /* 视口较窄、左侧空白不足以容纳侧栏时，回退为占位布局（避免被裁切） */
-@media (max-width: 1491px) {
+@media (max-width: 1661px) {
   .history-sidebar { margin-left: 0; }
 }
 
@@ -132,6 +132,7 @@ body {
 }
 
 .history-item {
+  position: relative;
   padding: 8px 10px;
   border-radius: 8px;
   cursor: pointer;
@@ -144,6 +145,30 @@ body {
   border-color: rgba(80, 112, 255, 0.35);
 }
 
+/* 删除按钮：悬浮于条目右上角，hover 条目时才显示 */
+.history-item-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.history-item:hover .history-item-del { opacity: 1; }
+.history-item-del:hover { background: rgba(220, 38, 38, 0.12); color: #dc2626; }
+
 .history-item-name {
   font-size: 12px;
   font-weight: 600;
@@ -151,6 +176,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding-right: 22px;   /* 给右上角删除按钮留位，避免文字被遮 */
 }
 
 .history-item-meta {
@@ -199,7 +225,8 @@ body {
 
 .param-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  /* 5 参数框一行：5×200px + 4×16px gap ≈ 1064px，1366 屏亦可容纳 */
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 16px;
 }
 

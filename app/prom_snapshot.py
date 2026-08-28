@@ -72,6 +72,39 @@ METRICS = [
         "unit": "req/s",
         "promql": "rate(num_preemptions_total[1m]) or rate(vllm:num_preemptions_total[1m])",
     },
+    # prefill / decode 阶段耗时（较新 vLLM 才暴露；旧版查询无数据自动跳过）
+    {
+        "key": "prefill_p50",
+        "group": "phase",
+        "legend": "Prefill p50",
+        "unit": "s",
+        "promql": "histogram_quantile(0.5, sum by (le) (rate(request_prefill_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[30s])))",
+    },
+    {
+        "key": "prefill_p95",
+        "group": "phase",
+        "legend": "Prefill p95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_prefill_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[30s])))",
+    },
+    {
+        "key": "decode_p50",
+        "group": "phase",
+        "legend": "Decode p50",
+        "unit": "s",
+        "promql": "histogram_quantile(0.5, sum by (le) (rate(request_decode_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[30s])))",
+    },
+    {
+        "key": "decode_p95",
+        "group": "phase",
+        "legend": "Decode p95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_decode_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[30s])))",
+    },
 ]
 
 

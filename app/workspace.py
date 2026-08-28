@@ -7,6 +7,7 @@ workspace/<任务名>/ 目录下保存：
 import json
 import os
 import re
+import shutil
 import time
 
 from . import _paths
@@ -23,6 +24,20 @@ def _task_dir(task_name: str) -> str:
 
 def valid_name(task_name: str) -> bool:
     return bool(task_name) and bool(_NAME_RE.match(task_name)) and ".." not in task_name
+
+
+def delete_task(task_name: str) -> bool:
+    """删除任务目录（含 config/result/metrics 全部数据）。
+
+    任务不存在或名称非法返回 False；删除失败抛 OSError 由调用方处理。
+    """
+    if not valid_name(task_name):
+        return False
+    path = _task_dir(task_name)
+    if not os.path.isdir(path):
+        return False
+    shutil.rmtree(path)
+    return True
 
 
 def new_task_name(kind: str) -> str:

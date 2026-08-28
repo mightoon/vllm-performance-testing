@@ -86,6 +86,7 @@ async def api_verify_model(payload: ModelPayload):
 
 class TextTestPayload(BaseModel):
     model_id: str
+    input_length: str = "tiny"
     noun_count: int = 5
     article_length: int = 500
     concurrency: int = 2
@@ -93,14 +94,18 @@ class TextTestPayload(BaseModel):
 
 @app.post("/api/tests/text/start")
 async def api_text_start(payload: TextTestPayload):
+    from .prompt_templates import LENGTH_SPECS
+    if payload.input_length not in LENGTH_SPECS:
+        return JSONResponse({"success": False, "error": "输入长度档位非法"}, 400)
     if payload.noun_count < 1 or payload.noun_count > 100:
-        return JSONResponse({"success": False, "error": "名词数量需在 1-100 之间"}, 400)
+        return JSONResponse({"success": False, "error": "迭代次数需在 1-100 之间"}, 400)
     if payload.article_length < 50 or payload.article_length > 10000:
-        return JSONResponse({"success": False, "error": "文章字数需在 50-10000 之间"}, 400)
+        return JSONResponse({"success": False, "error": "输出长度需在 50-10000 字之间"}, 400)
     if payload.concurrency < 1 or payload.concurrency > 1000:
         return JSONResponse({"success": False, "error": "并发度需在 1-1000 之间"}, 400)
     return text_engine.start(payload.model_id, payload.noun_count,
-                             payload.article_length, payload.concurrency)
+                             payload.article_length, payload.concurrency,
+                             payload.input_length)
 
 
 @app.get("/api/tests/text/status")
@@ -223,6 +228,22 @@ def api_text_history_detail(task_name: str):
     if task is None:
         return JSONResponse({"success": False, "error": "任务不存在"}, 404)
     return {"success": True, "config": task["config"], "result": task["result"]}
+
+
+@app.delete("/api/tests/text/history/{task_name}")
+def api_text_history_delete(task_name: str):
+    """删除历史任务：整体移除 workspace/<任务名>/ 目录（含结果与监控快照）。"""
+    # 运行中的任务禁止删除（目录正被引擎写入）
+    if (text_engine.task_name == task_name
+            and text_engine.status in ("running", "stopping")):
+        return JSONResponse({"success": False, "error": "任务运行中，无法删除"}, 409)
+    try:
+        ok = workspace.delete_task(task_name)
+    except OSError as e:
+        return JSONResponse({"success": False, "error": f"删除失败：{e}"}, 500)
+    if not ok:
+        return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    return {"success": True}
 
 
 # ==================== Prometheus 监控 ====================

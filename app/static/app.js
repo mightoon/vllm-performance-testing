@@ -333,6 +333,7 @@ function historyItemHtml(t, selected, isDraft) {
       .filter(Boolean).join(" · ");
   }
   return `<div class="history-item ${t.name === selected ? "active" : ""}" data-name="${escapeHtml(t.name)}">` +
+    (isDraft ? "" : `<button class="history-item-del" title="删除该测试">✕</button>`) +
     `<div class="history-item-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>` +
     `<div class="history-item-meta">` +
     `<span class="history-item-status ${st}">${stText}</span>` +
@@ -431,8 +432,9 @@ const MONITOR_GROUP_TITLES = {
   latency: "首 token 延迟（TTFT）",
   throughput: "生成吞吐",
   preemption: "请求抢占（KV cache 耗尽时调度器强制腾位）",
+  phase: "Prefill / Decode 阶段耗时",
 };
-const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "throughput", "preemption"];
+const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "phase", "throughput", "preemption"];
 
 function renderMonitorCharts(metrics, summary) {
   const fmt = (v) => v == null ? "—" :
@@ -511,7 +513,7 @@ function renderMonitorCharts(metrics, summary) {
         animation: false,
         tooltip: {
           trigger: "axis",
-          axisPointer: { type: "cross" },
+          axisPointer: { type: "none" },   // 仅保留浮动信息窗，不画十字指示线与轴刻度
           valueFormatter: (v) => v == null ? "—" : `${(+v).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`,
         },
         legend: seriesList.length > 1 ? { bottom: 0, icon: "rect", itemWidth: 14, itemHeight: 4 } : undefined,
@@ -614,6 +616,8 @@ function renderReport(config, result) {
     sel.appendChild(opt);
   }
   sel.value = p.model_id || "";
+  // 旧任务无 input_length 字段时回退「极短」（与旧行为一致）
+  $("inputLength").value = p.input_length || "tiny";
   $("nounCount").value = p.noun_count ?? "";
   $("articleLength").value = p.article_length ?? "";
   $("concurrency").value = p.concurrency ?? "";
@@ -639,8 +643,28 @@ function renderReport(config, result) {
   setRunningUI(false);
 }
 
-/* 侧栏点击：草稿项→运行模式；运行中任务→回到实时监控；已结束任务→报告模式 */
+/* 删除历史测试：后端删除 workspace/<任务名>/ 目录（含结果与监控快照） */
+async function deleteHistoryTask(name) {
+  if (!confirm(`确定删除「${name}」？\n该测试在 workspace 目录中的数据将一并删除，不可恢复。`)) return;
+  const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (!r || !r.success) return alert((r && r.error) || "删除失败");
+  // 删除的是当前正在查看的任务：退出报告/状态视图，回到运行模式
+  if (textActiveTask === name || textStatusViewTask === name) {
+    enterRunMode();
+  }
+  if (textCurrentTask === name) textCurrentTask = null;
+  await loadTextHistory();   // 重新拉取列表刷新侧栏
+}
+
+/* 侧栏点击：删除按钮→删除任务；草稿项→运行模式；运行中任务→回到实时监控；已结束任务→报告模式 */
 $("textHistoryList").addEventListener("click", (e) => {
+  // 删除按钮优先处理，且不触发条目的"查看"行为
+  const del = e.target.closest(".history-item-del");
+  if (del) {
+    const item = del.closest(".history-item");
+    if (item) deleteHistoryTask(item.dataset.name);
+    return;
+  }
   const item = e.target.closest(".history-item");
   if (!item) return;
   if (textMode === "run" && item.dataset.name === textDraftTask) {
@@ -668,6 +692,7 @@ $("btnNewTextTest").addEventListener("click", () => {
   textCurrentTask = null;   // 清除最近任务，避免轮询回显旧结果、侧栏高亮旧任务
   // 参数区留空
   $("textModelSelect").value = "";
+  $("inputLength").value = "tiny";
   $("nounCount").value = "";
   $("articleLength").value = "";
   $("concurrency").value = "";
@@ -696,6 +721,7 @@ $("btnRunText").addEventListener("click", async () => {
   if (!modelId) return alert("请先选择模型配置");
   const payload = {
     model_id: modelId,
+    input_length: $("inputLength").value || "tiny",
     noun_count: parseInt($("nounCount").value) || 5,
     article_length: parseInt($("articleLength").value) || 500,
     concurrency: parseInt($("concurrency").value) || 2,
@@ -1084,6 +1110,8 @@ function renderVllmBar(m, mode = "live") {
     ["平均前缀缓存命中", pct(m.prefix_cache_hit_rate_avg)],
     ["平均首字延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
     ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
+    ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
+    ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
     ["累计输入 tokens", num(m.prompt_tokens_total)],
     ["累计生成 tokens", num(m.generation_tokens_total)],
     ["累计抢占次数", num(m.preemptions_total)],
@@ -1095,6 +1123,8 @@ function renderVllmBar(m, mode = "live") {
     ["前缀缓存命中", pct(m.prefix_cache_hit_rate)],
     ["平均首字延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
     ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
+    ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
+    ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
     ["累计输入 tokens", num(m.prompt_tokens_total)],
     ["累计生成 tokens", num(m.generation_tokens_total)],
     ["累计抢占次数", num(m.preemptions_total)],

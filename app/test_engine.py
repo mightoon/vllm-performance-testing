@@ -13,6 +13,7 @@ from typing import Optional
 from . import model_store
 from .llm_client import chat_completion_stream, fetch_vllm_metrics
 from .noun_library import pick_nouns_pool
+from . import prompt_templates
 from . import prom_snapshot
 from . import workspace
 
@@ -175,7 +176,7 @@ class TextTestEngine:
     # ---------- 启动 / 停止 ----------
 
     def start(self, model_id: str, noun_count: int, article_length: int,
-              concurrency: int) -> dict:
+              concurrency: int, input_length: str = "tiny") -> dict:
         if self.status == "running":
             return {"success": False, "error": "测试已在运行中，请先停止"}
         model = model_store.get_model(model_id)
@@ -186,6 +187,7 @@ class TextTestEngine:
         self.params = {
             "model_id": model_id,
             "model_name": model["name"],
+            "input_length": input_length,
             "noun_count": noun_count,
             "article_length": article_length,
             "concurrency": concurrency,
@@ -407,6 +409,7 @@ class TextTestEngine:
         # 归零，重新校准基线。
         for k in ("prompt_tokens_total", "generation_tokens_total",
                   "ttft_sum", "ttft_cnt", "tpot_sum", "tpot_cnt",
+                  "prefill_sum", "prefill_cnt", "decode_sum", "decode_cnt",
                   "pc_hits", "pc_queries", "preemptions_total"):
             cur = m.get(k)
             if cur is None:
@@ -416,8 +419,8 @@ class TextTestEngine:
                 self._counter_baseline[k] = cur
                 base = cur
             m[k] = cur - base
-        # TTFT/TPOT/前缀缓存命中：sum/count 同为累计 counter，
-        # 用扣除基线后的差分重算"本轮"均值/命中率，避免被
+        # TTFT/TPOT/prefill/decode/前缀缓存命中：sum/count 同为累计
+        # counter，用扣除基线后的差分重算"本轮"均值/命中率，避免被
         # 之前测试轮次的负载污染（本轮尚无完成请求时为 None）
         if m.get("ttft_sum") is not None and m.get("ttft_cnt") is not None:
             m["ttft_avg_s"] = (round(m["ttft_sum"] / m["ttft_cnt"], 3)
@@ -425,6 +428,14 @@ class TextTestEngine:
         if m.get("tpot_sum") is not None and m.get("tpot_cnt") is not None:
             m["tpot_avg_s"] = (round(m["tpot_sum"] / m["tpot_cnt"], 3)
                                if m["tpot_cnt"] > 0 else None)
+        if (m.get("prefill_sum") is not None
+                and m.get("prefill_cnt") is not None):
+            m["prefill_avg_s"] = (round(m["prefill_sum"] / m["prefill_cnt"], 3)
+                                  if m["prefill_cnt"] > 0 else None)
+        if (m.get("decode_sum") is not None
+                and m.get("decode_cnt") is not None):
+            m["decode_avg_s"] = (round(m["decode_sum"] / m["decode_cnt"], 3)
+                                 if m["decode_cnt"] > 0 else None)
         if m.get("pc_hits") is not None and m.get("pc_queries") is not None:
             m["prefix_cache_hit_rate"] = (
                 round(m["pc_hits"] / m["pc_queries"], 4)
@@ -450,7 +461,8 @@ class TextTestEngine:
                 if st.get(key) is None or v > st[key]:
                     st[key] = v
         for k in ("gen_throughput_toks", "gpu_cache_usage",
-                  "prefix_cache_hit_rate", "ttft_avg_s", "tpot_avg_s"):
+                  "prefix_cache_hit_rate", "ttft_avg_s", "tpot_avg_s",
+                  "prefill_avg_s", "decode_avg_s"):
             v = m.get(k)
             if v is not None:
                 st[k + "_sum"] = st.get(k + "_sum", 0.0) + v
@@ -508,6 +520,12 @@ class TextTestEngine:
                 "ttft_sum", "ttft_cnt", 3, "ttft_avg_s"),
             "tpot_avg_s": final_ratio(
                 "tpot_sum", "tpot_cnt", 3, "tpot_avg_s"),
+            # prefill/decode 阶段平均耗时（请求等权，终值差分；
+            # 旧版 vLLM 无此指标时为 None → 前端显示 —）
+            "prefill_avg_s": final_ratio(
+                "prefill_sum", "prefill_cnt", 3, "prefill_avg_s"),
+            "decode_avg_s": final_ratio(
+                "decode_sum", "decode_cnt", 3, "decode_avg_s"),
             "ttft_p50_fit_s": p50,
             "ttft_p95_fit_s": p95,
             # tokens 为本轮累计 counter（已扣除基线），取最后一次快照
@@ -646,12 +664,15 @@ class TextTestEngine:
                     return
                 case.current_noun = noun
                 case.completed_loops = i
-                prompt = (f'围绕"{noun}"写一篇{self.params["article_length"]}字的文章。'
-                          f'直接输出文章正文。')
+                # 按输入长度档位构建 prompt：名词填充模板全部变量
+                prompt = prompt_templates.build_prompt(
+                    self.params.get("input_length", "tiny"), noun,
+                    self.params["article_length"])
                 # 流式生成：on_chunk 实时更新 qa["partial"]，
-                # 前端详情弹窗轮询时即可看到"LLM 正在回复"的流式效果
+                # 前端详情弹窗轮询时即可看到"LLM 正在回复"的流式效果。
+                # question 截断存储：超长档全文 2.7 万字，仅存首尾避免 result.json 膨胀
                 qa = case.begin_qa("生成文章", loop=i + 1, noun=noun,
-                                   question=prompt)
+                                   question=prompt_templates.truncate_for_store(prompt))
 
                 def _on_chunk(delta: str, _qa=qa) -> None:
                     now = time.time()

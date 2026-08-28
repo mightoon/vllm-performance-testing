@@ -1,6 +1,6 @@
 {
   "server": {
-    "port": 5888
+    "port": 8000
   },
   "models": [
     {
