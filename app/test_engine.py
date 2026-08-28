@@ -351,19 +351,25 @@ class TextTestEngine:
 
     async def _poll_vllm_metrics(self):
         """后台每 5 秒抓取一次 vLLM /metrics 主要指标。失败时记录错误信息。"""
-        api_key = model_store.decode_key(self._model.get("api_key", ""))
-        while self.status == "running":
-            r = await fetch_vllm_metrics(self._model["url"], api_key=api_key)
-            if r["success"]:
-                self._apply_metrics_sample(r)
-            else:
-                self.vllm_metrics = {"error": r["error"]}
-            try:
-                # 可中断的 sleep：用户停止测试时立即退出
-                await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
-                break
-            except asyncio.TimeoutError:
-                continue
+        try:
+            api_key = model_store.decode_key(self._model.get("api_key", ""))
+            while self.status == "running":
+                try:
+                    r = await fetch_vllm_metrics(self._model["url"], api_key=api_key)
+                    if r["success"]:
+                        self._apply_metrics_sample(r)
+                    else:
+                        self.vllm_metrics = {"error": r["error"]}
+                except Exception:
+                    self.vllm_metrics = {"error": "vLLM 指标抓取异常"}
+                try:
+                    # 可中断的 sleep：用户停止测试时立即退出
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            pass
 
     def _apply_metrics_sample(self, r: dict) -> None:
         """处理一次成功的 /metrics 采样（轮询与测试结束时最终抓取共用）：

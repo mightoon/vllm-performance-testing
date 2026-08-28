@@ -9,8 +9,9 @@ import os
 import re
 import time
 
-WORKSPACE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workspace")
+from . import _paths
+
+WORKSPACE_DIR = os.path.join(_paths.data_root(), "workspace")
 
 # 任务名合法字符：中文/字母/数字/连字符（防路径穿越）
 _NAME_RE = re.compile(r"^[\w\u4e00-\u9fff\-]+$")

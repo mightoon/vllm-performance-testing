@@ -9,12 +9,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 
+from . import _paths
 from . import model_store
 from . import prom_snapshot
 from . import workspace
 from .llm_client import verify_connection
 from .test_engine import text_engine
-import os
+
+# PyInstaller 模式下首次运行时复制内置 config.json 到可执行文件目录
+_paths.ensure_config()
 
 app = FastAPI(title="LLM 测试平台")
 
@@ -250,7 +253,10 @@ async def api_prom_test(payload: PromConfigPayload):
     url = payload.url.strip()
     if not url:
         return JSONResponse({"success": False, "error": "URL 不能为空"}, 400)
-    return await prom_snapshot.test_connection(url)
+    try:
+        return await prom_snapshot.test_connection(url)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.get("/api/tests/text/history/{task_name}/metrics")
@@ -281,5 +287,5 @@ async def api_text_history_metrics(task_name: str):
 
 # ==================== 静态页面 ====================
 
-_static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+_static_dir = _paths.static_dir()
 app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")

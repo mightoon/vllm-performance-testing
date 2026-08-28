@@ -84,8 +84,8 @@ def _step_for(start: float, end: float) -> int:
 async def _query_range(client: httpx.AsyncClient, base_url: str, promql: str,
                        start: float, end: float, step: int) -> list:
     """单条 query_range。返回 [t, v] 点列表；失败/无数据返回 []。"""
-    url = base_url.rstrip("/") + "/api/v1/query_range"
     try:
+        url = base_url.rstrip("/") + "/api/v1/query_range"
         resp = await client.get(url, params={
             "query": promql, "start": start, "end": end, "step": step})
         if resp.status_code != 200:
@@ -100,7 +100,7 @@ async def _query_range(client: httpx.AsyncClient, base_url: str, promql: str,
             if len(values) > len(best):
                 best = values
         return best
-    except (httpx.HTTPError, ValueError):
+    except Exception:
         return []
 
 
@@ -142,36 +142,47 @@ def _to_f(v) -> float:
 
 
 async def fetch_snapshot(base_url: str, start: float, end: float) -> dict:
-    """按起止时间拉取全部指标，组装快照 dict。单条失败跳过，不整体失败。"""
-    step = _step_for(start, end)
-    series = []
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for m in METRICS:
-            values = await _query_range(client, base_url, m["promql"],
-                                        start, end, step)
-            if not values:
-                continue
-            series.append({
-                "key": m["key"],
-                "group": m["group"],
-                "legend": m["legend"],
-                "unit": m["unit"],
-                "promql": m["promql"],
-                # Prometheus 返回的 value 为字符串，转 float（NaN → None）
-                "data": [[t, _to_f(v)] for t, v in values],
-            })
-    return {
-        "schema_version": 1,
-        "source": base_url,
-        "range": {"start": start, "end": end, "step": step},
-        "fetched_at": time.time(),
-        "series": series,
-        "stats": _compute_stats(series),
-    }
+    """按起止时间拉取全部指标，组装快照 dict。单条失败跳过，不整体失败。
+    Prometheus 不可达时静默返回空快照，不抛异常。"""
+    try:
+        step = _step_for(start, end)
+        series = []
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for m in METRICS:
+                values = await _query_range(client, base_url, m["promql"],
+                                            start, end, step)
+                if not values:
+                    continue
+                series.append({
+                    "key": m["key"],
+                    "group": m["group"],
+                    "legend": m["legend"],
+                    "unit": m["unit"],
+                    "promql": m["promql"],
+                    # Prometheus 返回的 value 为字符串，转 float（NaN → None）
+                    "data": [[t, _to_f(v)] for t, v in values],
+                })
+        return {
+            "schema_version": 1,
+            "source": base_url,
+            "range": {"start": start, "end": end, "step": step},
+            "fetched_at": time.time(),
+            "series": series,
+            "stats": _compute_stats(series),
+        }
+    except Exception:
+        return {
+            "schema_version": 1,
+            "source": base_url,
+            "range": {"start": start, "end": end, "step": 0},
+            "fetched_at": time.time(),
+            "series": [],
+            "stats": {},
+        }
 
 
 async def test_connection(base_url: str) -> dict:
-    """连通性验证：查询 up。"""
+    """连通性验证：查询 up。Prometheus 不可达时静默返回失败，不抛异常。"""
     url = base_url.rstrip("/") + "/api/v1/query"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -179,7 +190,7 @@ async def test_connection(base_url: str) -> dict:
         if resp.status_code == 200 and resp.json().get("status") == "success":
             return {"success": True}
         return {"success": False, "error": f"HTTP {resp.status_code}"}
-    except httpx.HTTPError as e:
+    except Exception as e:
         return {"success": False, "error": str(e)}
 
 

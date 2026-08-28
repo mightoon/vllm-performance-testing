@@ -17,12 +17,40 @@
 
 ## 运行
 
+### 方式一：python run.py（推荐，端口读配置）
+
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+python run.py
 ```
 
-浏览器访问 http://127.0.0.1:8000
+服务端口在 `config.json` → `server.port` 中配置（默认 5888，非法或缺失时自动回退默认值）：
+
+```json
+{
+  "server": { "port": 5888 },
+  "models": [],
+  "prometheus": { "url": "", "grafana_url": "" }
+}
+```
+
+### 方式二：python -m uvicorn 直接启动（端口由命令行指定）
+
+```bash
+pip install -r requirements.txt
+python -m uvicorn app.main:app --host 0.0.0.0 --port 5888
+```
+
+浏览器访问 http://127.0.0.1:5888
+
+### 打包为可执行文件（免 Python 环境运行）
+
+```bash
+pip install pyinstaller
+pyinstaller llm_test.spec --noconfirm
+```
+
+生成的 `dist/llm_test.exe` 可直接复制到其他 Windows 机器运行。首次运行会在 exe 同目录自动生成 `config.json` 和 `workspace/`，修改端口只需编辑该 `config.json` 后重启。
 
 ## 目录结构
 

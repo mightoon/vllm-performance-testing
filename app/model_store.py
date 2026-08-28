@@ -9,7 +9,9 @@ import uuid
 from threading import Lock
 from typing import Optional
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+from . import _paths
+
+CONFIG_FILE = os.path.join(_paths.data_root(), "config.json")
 
 _lock = Lock()
 
@@ -20,8 +22,11 @@ def _load_all() -> dict:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or "models" not in data:
+        if not isinstance(data, dict):
             return {"models": []}
+        # models 缺失/类型不对时仅归一化该键，保留 server/prometheus 等其他配置节
+        if not isinstance(data.get("models"), list):
+            data["models"] = []
         return data
     except (json.JSONDecodeError, OSError):
         return {"models": []}
@@ -134,6 +139,28 @@ def delete_model(model_id: str) -> bool:
             return False
         _save_all(data)
     return True
+
+
+# ==================== 服务配置 ====================
+
+DEFAULT_SERVER_PORT = 5888
+
+
+def get_server_port() -> int:
+    """读取服务监听端口（config.json → server.port）。
+    配置缺失、类型非法或超出范围时回退默认端口，不抛异常。"""
+    with _lock:
+        data = _load_all()
+    port = (data.get("server") or {}).get("port", DEFAULT_SERVER_PORT)
+    if isinstance(port, bool):  # bool 是 int 子类，需排除
+        return DEFAULT_SERVER_PORT
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return DEFAULT_SERVER_PORT
+    if 1 <= port <= 65535:
+        return port
+    return DEFAULT_SERVER_PORT
 
 
 # ==================== Prometheus 配置 ====================
