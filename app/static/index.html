@@ -68,6 +68,7 @@
         <div class="run-area-title-group">
           <h3 id="runPanelTitle">测试状态</h3>
           <button class="btn-report" id="btnGenReport" style="display:none">📊 生成报告</button>
+          <button class="btn-report" id="btnBackStatus" style="display:none">📈 测试状态</button>
         </div>
         <div class="refresh-control">
           <label>刷新间隔</label>
@@ -92,7 +93,7 @@
       </div>
       <!-- vLLM 服务端指标条（全局，不区分 case；随状态轮询刷新，不低于 15s 一次） -->
       <div class="vllm-bar" id="vllmBar" style="display:none">
-        <div class="vllm-bar-title">vLLM 指标</div>
+        <div class="vllm-bar-title" id="vllmBarTitle">vLLM 指标</div>
         <div class="detail-grid vllm-grid" id="vllmBarItems"></div>
       </div>
       <div class="progress-list" id="progressList">

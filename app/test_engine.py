@@ -5,6 +5,7 @@
 并发度 = 同时运行的 case 数。每个 case 的进度通过轮询接口暴露给前端进度条。
 """
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -163,7 +164,11 @@ class TextTestEngine:
         self._model: Optional[dict] = None
         self.vllm_metrics: Optional[dict] = None    # 最新 vLLM 指标（或 {"error": ...}）
         self._metrics_task: Optional[asyncio.Task] = None
-        self._token_baseline: dict = {}   # 本轮测试开始时的 counter 基线
+        self._counter_baseline: dict = {}  # 本轮测试开始时的 counter 基线
+        self._metrics_stats: dict = {}    # 整轮指标统计累加器（峰值/均值，供报告模式）
+        self._last_gt_sample: Optional[tuple] = None  # (采样时刻, generation_tokens_total)，吞吐差分用
+        self._ttft_buckets = None         # 最近一次基线差分后的 TTFT 直方图桶
+        self._ttft_bucket_base = None     # 桶累计计数基线 {le: count}
         self._noun_pool: list = []        # 全局名词池（各 thread 取不重叠分片）
         self.task_name: str = ""          # 本轮测试任务名（workspace 目录名）
 
@@ -211,7 +216,11 @@ class TextTestEngine:
         loop.create_task(self._wait_all())
         # 后台抓取 vLLM /metrics（供 case 详情弹窗展示）
         self.vllm_metrics = None
-        self._token_baseline = {}
+        self._counter_baseline = {}
+        self._metrics_stats = {}
+        self._last_gt_sample = None
+        self._ttft_buckets = None
+        self._ttft_bucket_base = None
         self._metrics_task = loop.create_task(self._poll_vllm_metrics())
         # 持久化：启动即写 config（profile + 模型快照），结束后由 _wait_all 写 result
         workspace.save_config(self.task_name, {
@@ -300,11 +309,24 @@ class TextTestEngine:
         if self.status == "running":
             self.status = "completed"
             self.finished_at = time.time()
+        # 最终指标抓取：轮询间隔最多滞后 5s，结束时补一次采样，
+        # 让报告的终值差分（TTFT/TPOT 均值、命中率、抢占数、tokens）
+        # 覆盖到最后一批完成的请求。失败则沿用最后一次轮询快照。
+        if self._model:
+            try:
+                api_key = model_store.decode_key(self._model.get("api_key", ""))
+                r = await fetch_vllm_metrics(self._model["url"], api_key=api_key)
+                if r["success"]:
+                    self._apply_metrics_sample(r)
+            except Exception:
+                pass  # 最终抓取失败不影响测试结果
         # 持久化：测试结束（完成/停止/出错）后写 result（含各 case 问答历史）
         if self.task_name:
             try:
                 result = self.status_dict()
                 result["cases"] = [self.case_detail(c.case_id) for c in self.cases]
+                # 整轮 vLLM 指标统计（报告模式展示；区别于最后一次实时快照）
+                result["vllm_metrics_summary"] = self._vllm_metrics_summary()
                 workspace.save_result(self.task_name, result)
             except OSError:
                 pass  # 磁盘写入失败不影响测试本身
@@ -330,37 +352,10 @@ class TextTestEngine:
     async def _poll_vllm_metrics(self):
         """后台每 5 秒抓取一次 vLLM /metrics 主要指标。失败时记录错误信息。"""
         api_key = model_store.decode_key(self._model.get("api_key", ""))
-        last_sample: Optional[tuple] = None  # (采样时刻, generation_tokens_total)
         while self.status == "running":
             r = await fetch_vllm_metrics(self._model["url"], api_key=api_key)
             if r["success"]:
-                m = r["metrics"]
-                now = time.time()
-                # 新版 vLLM 移除了吞吐 gauge：
-                # 用 generation_tokens_total 两次采样的差分计算 tok/s
-                if m.get("gen_throughput_toks") is None:
-                    gt = m.get("generation_tokens_total")
-                    if (last_sample is not None and gt is not None
-                            and last_sample[1] is not None
-                            and now > last_sample[0]):
-                        dt = now - last_sample[0]
-                        m["gen_throughput_toks"] = round(
-                            (gt - last_sample[1]) / dt, 1)
-                    last_sample = (now, gt)
-                # prompt/generation_tokens_total 是 vLLM 服务启动起累加的
-                # counter（跨测试轮次不归零）：扣除本轮首次采样时的基线，
-                # 得到"本轮测试"的累计值。若当前值小于基线，说明 vLLM
-                # 中途重启 counter 归零，重新校准基线。
-                for k in ("prompt_tokens_total", "generation_tokens_total"):
-                    cur = m.get(k)
-                    if cur is None:
-                        continue
-                    base = self._token_baseline.get(k)
-                    if base is None or cur < base:
-                        self._token_baseline[k] = cur
-                        base = cur
-                    m[k] = cur - base
-                self.vllm_metrics = m
+                self._apply_metrics_sample(r)
             else:
                 self.vllm_metrics = {"error": r["error"]}
             try:
@@ -369,6 +364,229 @@ class TextTestEngine:
                 break
             except asyncio.TimeoutError:
                 continue
+
+    def _apply_metrics_sample(self, r: dict) -> None:
+        """处理一次成功的 /metrics 采样（轮询与测试结束时最终抓取共用）：
+        TTFT 直方图与 counter 基线差分、重算本轮均值/命中率、
+        累计整轮统计、更新实时快照。"""
+        m = r["metrics"]
+        now = time.time()
+        # TTFT 直方图桶（累计 counter）：同样扣除本轮基线，
+        # 供报告模式做区间删失 MLE 拟合分位数。首次采样或
+        # vLLM 重启 counter 归零时（重新）校准基线。
+        bks = r.get("ttft_buckets") or []
+        if bks:
+            base = self._ttft_bucket_base
+            if base is None or any(
+                    c < base.get(le, 0) for le, c in bks):
+                base = {le: c for le, c in bks}
+                self._ttft_bucket_base = base
+            self._ttft_buckets = [
+                (le, c - base.get(le, 0)) for le, c in bks]
+        # 新版 vLLM 移除了吞吐 gauge：
+        # 用 generation_tokens_total 两次采样的差分计算 tok/s
+        if m.get("gen_throughput_toks") is None:
+            gt = m.get("generation_tokens_total")
+            ls = self._last_gt_sample
+            if (ls is not None and gt is not None
+                    and ls[1] is not None
+                    and now > ls[0]):
+                dt = now - ls[0]
+                m["gen_throughput_toks"] = round(
+                    (gt - ls[1]) / dt, 1)
+            self._last_gt_sample = (now, gt)
+        # 以下均为 vLLM 服务启动起累加的 counter（跨测试轮次
+        # 不归零）：扣除本轮首次采样时的基线，得到"本轮测试"
+        # 的值。若当前值小于基线，说明 vLLM 中途重启 counter
+        # 归零，重新校准基线。
+        for k in ("prompt_tokens_total", "generation_tokens_total",
+                  "ttft_sum", "ttft_cnt", "tpot_sum", "tpot_cnt",
+                  "pc_hits", "pc_queries", "preemptions_total"):
+            cur = m.get(k)
+            if cur is None:
+                continue
+            base = self._counter_baseline.get(k)
+            if base is None or cur < base:
+                self._counter_baseline[k] = cur
+                base = cur
+            m[k] = cur - base
+        # TTFT/TPOT/前缀缓存命中：sum/count 同为累计 counter，
+        # 用扣除基线后的差分重算"本轮"均值/命中率，避免被
+        # 之前测试轮次的负载污染（本轮尚无完成请求时为 None）
+        if m.get("ttft_sum") is not None and m.get("ttft_cnt") is not None:
+            m["ttft_avg_s"] = (round(m["ttft_sum"] / m["ttft_cnt"], 3)
+                               if m["ttft_cnt"] > 0 else None)
+        if m.get("tpot_sum") is not None and m.get("tpot_cnt") is not None:
+            m["tpot_avg_s"] = (round(m["tpot_sum"] / m["tpot_cnt"], 3)
+                               if m["tpot_cnt"] > 0 else None)
+        if m.get("pc_hits") is not None and m.get("pc_queries") is not None:
+            m["prefix_cache_hit_rate"] = (
+                round(m["pc_hits"] / m["pc_queries"], 4)
+                if m["pc_queries"] > 0 else None)
+        self._accumulate_metrics_stats(m)
+        self.vllm_metrics = m
+
+    def _accumulate_metrics_stats(self, m: dict):
+        """累计整轮测试的 vLLM 指标统计（供报告模式展示）。
+
+        请求类指标记峰值；吞吐/KV 占用等 gauge 累加求时间平均；
+        TTFT/TPOT/命中率的采样点累计均值仅作终值缺失时的回退
+        （报告主口径是最后一次快照的 counter 差分，见
+        _vllm_metrics_summary）；tokens/抢占累计值无需统计
+        （取最后一次快照即可）。
+        """
+        st = self._metrics_stats
+        st["samples"] = st.get("samples", 0) + 1
+        for k in ("running_requests", "waiting_requests"):
+            v = m.get(k)
+            if v is not None:
+                key = k + "_max"
+                if st.get(key) is None or v > st[key]:
+                    st[key] = v
+        for k in ("gen_throughput_toks", "gpu_cache_usage",
+                  "prefix_cache_hit_rate", "ttft_avg_s", "tpot_avg_s"):
+            v = m.get(k)
+            if v is not None:
+                st[k + "_sum"] = st.get(k + "_sum", 0.0) + v
+                st[k + "_n"] = st.get(k + "_n", 0) + 1
+
+    def _vllm_metrics_summary(self) -> Optional[dict]:
+        """汇总整轮测试的 vLLM 指标：请求峰值 + 吞吐/缓存均值 + 终值差分。
+
+        均值类（TTFT/TPOT/前缀缓存命中率）取最后一次快照的 counter
+        差分之比（请求等权真均值）；吞吐/KV 占用为 gauge，取采样点
+        时间平均。无有效采样（全部采集失败）时返回 None。
+        """
+        st = self._metrics_stats
+        if not st.get("samples"):
+            return None
+
+        def avg(key: str, digits: int) -> Optional[float]:
+            n = st.get(key + "_n", 0)
+            return round(st[key + "_sum"] / n, digits) if n else None
+
+        m = self.vllm_metrics if isinstance(self.vllm_metrics, dict) else {}
+
+        def final_ratio(num_key: str, den_key: str, digits: int,
+                        fallback_key: str) -> Optional[float]:
+            """终值差分比率（请求等权）。
+
+            各采样点的 sum/count 只是"截至当前"的累计均值 F(t)，对其
+            做时间平均会在指标随时间漂移时系统性失真（如排队期 TTFT
+            逐步上涨，时间平均明显低于终值——见 doc/metrics.md 案例四）。
+            正确口径是最后一次快照的 sum/count 差分之比 = F(T_end)。
+            终值缺失（最后一次抓取失败）时回退采样点时间平均。
+            """
+            num, den = m.get(num_key), m.get(den_key)
+            if num is not None and den:
+                return round(num / den, digits)
+            return avg(fallback_key, digits)
+
+        # TTFT 分位数：区间删失 MLE 拟合（修正 Prometheus 直方图宽桶
+        # 线性插值的系统性误差），锚定本轮精确均值（最后一次快照的
+        # sum/count 差分）
+        mean_s = (m["ttft_sum"] / m["ttft_cnt"]
+                  if m.get("ttft_sum") is not None and m.get("ttft_cnt")
+                  else None)
+        p50, p95 = self._fit_ttft_quantiles(mean_s)
+        return {
+            "samples": st["samples"],
+            "running_requests_max": st.get("running_requests_max"),
+            "waiting_requests_max": st.get("waiting_requests_max"),
+            "gen_throughput_toks_avg": avg("gen_throughput_toks", 1),
+            "gpu_cache_usage_avg": avg("gpu_cache_usage", 4),
+            # 均值/命中率：终值差分（请求等权），终值缺失时回退采样点平均
+            "prefix_cache_hit_rate_avg": final_ratio(
+                "pc_hits", "pc_queries", 4, "prefix_cache_hit_rate"),
+            "ttft_avg_s": final_ratio(
+                "ttft_sum", "ttft_cnt", 3, "ttft_avg_s"),
+            "tpot_avg_s": final_ratio(
+                "tpot_sum", "tpot_cnt", 3, "tpot_avg_s"),
+            "ttft_p50_fit_s": p50,
+            "ttft_p95_fit_s": p95,
+            # tokens 为本轮累计 counter（已扣除基线），取最后一次快照
+            "prompt_tokens_total": m.get("prompt_tokens_total"),
+            "generation_tokens_total": m.get("generation_tokens_total"),
+            # 本轮 KV cache 耗尽被抢占（重算）的请求总数：>0 即说明
+            # 并发×生成长度超出 KV 容量（TTFT 长尾/中途停顿的根源，
+            # 见 doc/metrics.md 案例四）
+            "preemptions_total": m.get("preemptions_total"),
+        }
+
+    def _fit_ttft_quantiles(self, mean_s: Optional[float]):
+        """区间删失 MLE 拟合本轮 TTFT 分布（对数正态），返回 (p50, p95)。
+
+        直方图桶计数只知"样本落在哪个桶"：以对数正态为模型，桶质量
+        构造似然；并用本轮精确均值作锚定约束（对数正态均值 =
+        exp(μ + σ²/2)，故 μ = ln(mean) - σ²/2），把问题化为一维
+        黄金分割搜索 σ，无需 scipy。桶数据缺失/无样本/拟合失败
+        （似然无有限值）时返回 (None, None)。
+        """
+        bks = self._ttft_buckets
+        if not bks or not mean_s or mean_s <= 0:
+            return None, None
+        # 累计桶计数展开为区间 (a, b] 与样本数；末桶 (le_max, +Inf)
+        counts = []
+        prev_le, prev_cum = 0.0, 0.0
+        total = 0
+        for le, cum in bks:
+            n = max(0, int(round(cum - prev_cum)))
+            counts.append((prev_le, le, n))
+            total += n
+            prev_le, prev_cum = le, cum
+        if total <= 0:
+            return None, None
+
+        sqrt2 = math.sqrt(2.0)
+        ln_mean = math.log(mean_s)
+
+        def cdf(x: float, mu: float, sigma: float) -> float:
+            return 0.5 * (1.0 + math.erf((x - mu) / (sigma * sqrt2)))
+
+        def nll(ln_sigma: float) -> float:
+            sigma = math.exp(ln_sigma)
+            mu = ln_mean - sigma * sigma / 2.0
+            v = 0.0
+            for a, b, n in counts:
+                if n <= 0:
+                    continue
+                if math.isinf(b):
+                    p = (1.0 - cdf(math.log(a), mu, sigma)) if a > 0 else 1.0
+                else:
+                    hi = cdf(math.log(b), mu, sigma)
+                    lo = cdf(math.log(a), mu, sigma) if a > 0 else 0.0
+                    p = hi - lo
+                if p <= 0.0:
+                    return float("inf")
+                v -= n * math.log(p)
+            return v
+
+        # 黄金分割搜索 ln(σ)，σ ∈ [1e-4, 5]
+        gr = (math.sqrt(5.0) - 1.0) / 2.0
+        a, b = math.log(1e-4), math.log(5.0)
+        c, d = b - gr * (b - a), a + gr * (b - a)
+        fc, fd = nll(c), nll(d)
+        for _ in range(100):
+            if b - a < 1e-7:
+                break
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c = b - gr * (b - a)
+                fc = nll(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + gr * (b - a)
+                fd = nll(d)
+        ln_sigma = (a + b) / 2.0
+        if not math.isfinite(nll(ln_sigma)):
+            return None, None
+        sigma = math.exp(ln_sigma)
+        mu = ln_mean - sigma * sigma / 2.0
+        p50 = math.exp(mu)
+        p95 = math.exp(mu + 1.6448536269514722 * sigma)
+        if not (0 < p50 < 1e6 and 0 < p95 < 1e6):
+            return None, None
+        return round(p50, 4), round(p95, 4)
 
     async def _wait_rampup(self, case: CaseState, delay: float) -> bool:
         """错峰启动等待。返回 False 表示测试已被停止。

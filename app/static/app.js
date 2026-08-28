@@ -288,6 +288,8 @@ let textMode = "run";          // "run" | "report"
 let textActiveTask = null;     // 报告模式下正在查看的任务名
 let textDraftTask = null;      // "新测试"草稿任务名（尚未启动）
 let textCurrentTask = null;    // 运行模式当前（或最近）任务名
+let textStatusViewTask = null; // 状态视图：从报告返回查看的历史任务名（null=跟随引擎实时状态）
+let statusViewResult = null;   // 状态视图缓存的 result.json（供 case 弹窗静态渲染）
 let lastHistoryTasks = [];     // 最近一次拉取的历史列表
 let lastTestStatus = null;     // 上次轮询到的测试状态（检测结束刷新侧栏）
 
@@ -358,8 +360,11 @@ function setPanelTitles(mode) {
 function enterRunMode() {
   textMode = "run";
   textActiveTask = null;
+  textStatusViewTask = null;   // 退出状态视图，恢复跟随引擎实时状态
+  statusViewResult = null;
   setPanelTitles("run");
   $("btnGenReport").style.display = "none";   // 运行模式隐藏，终态时由 renderStatus 显示
+  $("btnBackStatus").style.display = "none";  // 仅报告模式显示
   hideMonitor();   // 监控图表仅报告模式显示
   $("progressList").style.display = "";
   restartPolling();
@@ -396,7 +401,7 @@ async function loadMonitorCharts(taskName, config, result) {
     return;
   }
   $("monitorSource").textContent = r.source === "live" ? "（实时查询）" : "";
-  renderMonitorCharts(r.metrics);
+  renderMonitorCharts(r.metrics, (result || {}).vllm_metrics_summary);
 }
 
 /* Grafana 跳转链接（配置了 Grafana URL 时显示，带测试起止时间） */
@@ -425,21 +430,37 @@ const MONITOR_GROUP_TITLES = {
   cache: "KV cache 使用率",
   latency: "首 token 延迟（TTFT）",
   throughput: "生成吞吐",
+  preemption: "请求抢占（KV cache 耗尽时调度器强制腾位）",
 };
-const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "throughput"];
+const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "throughput", "preemption"];
 
-function renderMonitorCharts(metrics) {
+function renderMonitorCharts(metrics, summary) {
   const fmt = (v) => v == null ? "—" :
     v.toLocaleString(undefined, { maximumFractionDigits: 1 });
 
   // 统计卡片（后端预计算）
   const stats = metrics.stats || {};
+  // TTFT 分位数卡片：优先整轮区间删失 MLE 拟合值（修正直方图宽桶
+  // 线性插值误差）；无拟合数据（旧报告/拟合失败）回退 Prometheus 统计
+  const fitP50 = summary && summary.ttft_p50_fit_s != null
+    ? summary.ttft_p50_fit_s * 1000 : null;
+  const fitP95 = summary && summary.ttft_p95_fit_s != null
+    ? summary.ttft_p95_fit_s * 1000 : null;
   const cards = [
     ["平均生成吞吐", fmt(stats.gen_throughput_avg), "tok/s"],
     ["峰值生成吞吐", fmt(stats.gen_throughput_peak), "tok/s"],
-    ["平均 TTFT p50", fmt(stats.ttft_p50_avg_ms), "ms"],
-    ["峰值 TTFT p95", fmt(stats.ttft_p95_peak_ms), "ms"],
+    fitP50 != null
+      ? ["TTFT p50（拟合）", fmt(fitP50), "ms"]
+      : ["平均 TTFT p50", fmt(stats.ttft_p50_avg_ms), "ms"],
+    fitP95 != null
+      ? ["TTFT p95（拟合）", fmt(fitP95), "ms"]
+      : ["峰值 TTFT p95", fmt(stats.ttft_p95_peak_ms), "ms"],
     ["KV cache 峰值", fmt(stats.kv_cache_peak_perc), "%"],
+    // 抢占卡片：新报告显示精确累计次数（vLLM counter 差分）；
+    // 旧报告/实时监控无该数据时回退显示 Prometheus 抢占速率峰值
+    summary && summary.preemptions_total != null
+      ? ["累计抢占次数", fmt(summary.preemptions_total), "次"]
+      : ["抢占速率峰值", fmt(stats.preemptions_rate_peak), "req/s"],
   ];
   $("monitorCards").innerHTML = cards.map(([label, val, unit]) =>
     `<div class="monitor-card">
@@ -544,14 +565,40 @@ async function enterReportMode(taskName) {
   textMode = "report";
   textActiveTask = taskName;
   textDraftTask = null;
+  textStatusViewTask = null;   // 离开状态视图
+  statusViewResult = null;
   setPanelTitles("report");
   $("btnGenReport").style.display = "none";   // 已在报告页，无需该入口
+  $("btnBackStatus").style.display = "";      // 报告页提供"返回测试状态"入口
   // 不停止轮询：报告模式下 pollStatus 仅跟踪后台测试是否结束（刷新侧栏状态），不触碰报告显示
   closeCaseModal();
   const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}`);
   if (!r || !r.success) return alert((r && r.error) || "加载历史任务失败");
   renderReport(r.config || {}, r.result || {});
   loadMonitorCharts(taskName, r.config || {}, r.result || {});
+  renderHistoryList();
+}
+
+/* 从报告页返回该任务"测试结束时的状态页"：用持久化 result 重建终态视图。
+   与 enterRunMode 的区别：显示的是历史任务的终态而非引擎实时状态，
+   pollStatus 不覆盖显示、case 弹窗用缓存数据静态渲染（不请求引擎）。 */
+async function enterStatusView(taskName) {
+  textMode = "run";
+  textActiveTask = null;
+  textDraftTask = null;
+  textCurrentTask = taskName;   // 侧栏高亮与"生成报告"入口对齐该任务
+  textStatusViewTask = taskName;
+  statusViewResult = null;
+  setPanelTitles("run");
+  $("btnBackStatus").style.display = "none";   // 已在状态页
+  closeCaseModal();
+  hideMonitor();   // 监控图表仅报告模式显示
+  $("progressList").style.display = "";
+  const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}`);
+  if (!r || !r.success) return alert((r && r.error) || "加载历史任务失败");
+  statusViewResult = r.result || {};
+  lastVllmBarRender = 0;        // 绕过 15s 节流，首次进入立即渲染 vLLM 指标条
+  renderStatus(statusViewResult);
   renderHistoryList();
 }
 
@@ -581,7 +628,9 @@ function renderReport(config, result) {
   $("sumErrors").innerHTML = `错误: <b style="color:${sum.total_errors ? "var(--danger)" : "inherit"}">${sum.total_errors ?? "—"}</b>`;
   $("sumChars").innerHTML = `生成字数: <b>${(sum.total_chars ?? 0).toLocaleString()}</b>`;
   lastVllmBarRender = 0;   // 报告模式不受节流限制，立即渲染
-  renderVllmBar(result.vllm_metrics);
+  // 优先展示整轮统计；旧版报告（无统计数据）回退到最后一次快照
+  renderVllmBar(result.vllm_metrics_summary || result.vllm_metrics,
+                result.vllm_metrics_summary ? "report" : "legacy");
 
   // 报告模式：移除 thread 进度条区域
   $("progressList").style.display = "none";
@@ -629,6 +678,9 @@ $("btnNewTextTest").addEventListener("click", () => {
   $("vllmBar").style.display = "none";
   $("runEmpty").style.display = "block";
   $("btnGenReport").style.display = "none";   // 草稿模式隐藏"生成报告"入口
+  $("btnBackStatus").style.display = "none";  // 草稿模式隐藏"返回状态"入口
+  textStatusViewTask = null;                  // 退出状态视图，恢复轮询渲染
+  statusViewResult = null;
   hideMonitor();   // 监控图表仅报告模式显示
   setRunningUI(false);
   restartPolling();
@@ -677,6 +729,11 @@ $("btnGenReport").addEventListener("click", () => {
   if (textCurrentTask) enterReportMode(textCurrentTask);
 });
 
+/* 从报告页返回该任务测试结束时的状态页 */
+$("btnBackStatus").addEventListener("click", () => {
+  if (textActiveTask) enterStatusView(textActiveTask);
+});
+
 function setRunningUI(running) {
   $("btnRunText").disabled = running;
   $("btnStopText").disabled = !running;
@@ -722,6 +779,7 @@ async function pollStatus() {
     lastTestStatus = s.status;
   }
   if (textMode !== "run") return;   // 报告模式：仅跟踪后台测试状态，不覆盖报告显示
+  if (textStatusViewTask) return;   // 状态视图：显示历史任务终态，不被引擎实时状态覆盖
   // 草稿模式（已点"新测试"但尚未启动）：运行状态区保持清空，不回显上次测试结果
   if (textDraftTask && !textCurrentTask) {
     $("btnGenReport").style.display = "none";
@@ -835,6 +893,13 @@ function openCaseModal(caseId) {
   lastE2eRender = 0;           // 打开弹窗立即渲染一次端到端指标
   qaOutlineActive = null;      // 大纲恢复"跟随最新"模式
   toggleQaList(true);          // 打开即展开细节（运行中流式 / 已完成全量）
+  if (textStatusViewTask) {
+    // 状态视图（历史任务终态）：用缓存 result 静态渲染，不请求引擎实时数据
+    const c = ((statusViewResult && statusViewResult.cases) || [])
+      .find((x) => x.case_id === caseId);
+    if (c) renderCaseDetail({ case: c });
+    return;
+  }
   refreshCaseDetail();
 }
 
@@ -987,14 +1052,18 @@ function renderE2eMetrics(c) {
     `<span class="detail-v">${escapeHtml(String(v))}</span></div>`).join("");
 }
 
-/* vLLM 服务端指标方块（测试状态区域内，全局指标不区分 case；样式与弹窗指标方块一致） */
-function renderVllmBar(m) {
+/* vLLM 服务端指标方块（测试状态区域内，全局指标不区分 case；样式与弹窗指标方块一致）
+   mode="live"：运行模式，展示实时快照；
+   mode="report"：报告模式，展示整轮统计（峰值/均值/累计）；
+   mode="legacy"：旧版报告（无统计数据），回退到最后一次快照 */
+function renderVllmBar(m, mode = "live") {
   const bar = $("vllmBar");
   const el = $("vllmBarItems");
   bar.style.display = "block";
+  $("vllmBarTitle").textContent = mode === "live" ? "vLLM 指标（实时）" : "vLLM 指标";
   if (!m) {
     el.innerHTML = '<div class="detail-item"><span class="detail-v">' +
-      '指标采集中…</span></div>';
+      (mode === "live" ? "指标采集中…" : "暂无指标数据") + '</span></div>';
     return;
   }
   if (m.error) {
@@ -1005,16 +1074,30 @@ function renderVllmBar(m) {
   const pct = (v) => (v == null ? "—" : (v * 100).toFixed(1) + "%");
   const num = (v) => (v == null ? "—" :
     v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
-  const rows = [
+  const rows = mode === "report" ? [
+    // 整轮统计：请求类取峰值，吞吐/缓存占用取均值；TTFT/TPOT/命中率为
+    // 终值差分（请求等权），tokens/抢占为累计值
+    ["运行中请求峰值", num(m.running_requests_max)],
+    ["排队请求峰值", num(m.waiting_requests_max)],
+    ["平均生成吞吐", m.gen_throughput_toks_avg == null ? "—" : `${num(m.gen_throughput_toks_avg)} tok/s`],
+    ["平均 KV 缓存占用", pct(m.gpu_cache_usage_avg)],
+    ["平均前缀缓存命中", pct(m.prefix_cache_hit_rate_avg)],
+    ["平均首字延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
+    ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
+    ["累计输入 tokens", num(m.prompt_tokens_total)],
+    ["累计生成 tokens", num(m.generation_tokens_total)],
+    ["累计抢占次数", num(m.preemptions_total)],
+  ] : [
     ["运行中请求", num(m.running_requests)],
     ["排队请求", num(m.waiting_requests)],
     ["生成吞吐", m.gen_throughput_toks == null ? "—" : `${num(m.gen_throughput_toks)} tok/s`],
     ["KV 缓存占用", pct(m.gpu_cache_usage)],
     ["前缀缓存命中", pct(m.prefix_cache_hit_rate)],
     ["平均首字延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
-    ["平均逐字延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s`],
+    ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
     ["累计输入 tokens", num(m.prompt_tokens_total)],
     ["累计生成 tokens", num(m.generation_tokens_total)],
+    ["累计抢占次数", num(m.preemptions_total)],
   ];
   el.innerHTML = rows.map(([k, v]) =>
     `<div class="detail-item"><span class="detail-k">${k}</span>` +

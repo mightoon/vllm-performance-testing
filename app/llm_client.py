@@ -1,8 +1,75 @@
 """LLM API 客户端（OpenAI 兼容接口）。"""
+import asyncio
 import json
+import math
 import re
 
 import httpx
+
+
+# ---------------------------------------------------------------------------
+# 连接池复用（TCP keep-alive）
+# ---------------------------------------------------------------------------
+# 按服务地址缓存 AsyncClient，避免每次请求重新建立 TCP 连接。
+# 实测（内网 vLLM，见 doc/metrics.md 案例三）：每请求新建连接的开销
+# p50 ≈ 10ms / 均值 ≈ 20ms，100 并发冷启动时 p50 放大到 400ms+；
+# 复用连接后该开销基本消除，客户端 e2e TTFT 与服务端口径的差距
+# 从 ~37ms 缩小到 ~15ms。
+#
+# 服务端（uvicorn）默认 keep-alive 超时 5s，空闲连接会被单方面关闭，
+# 故 keepalive_expiry 取 4s 让客户端先主动过期；万一仍撞上服务端已
+# 关闭的连接（RemoteProtocolError 等），丢弃缓存重建连接重试一次。
+_client_cache: dict = {}  # key -> (client, 创建时的 event loop)
+
+# 后台关闭旧 client 的 task 引用（防止被 GC 中途回收）
+_close_tasks: set = set()
+
+# 疑似失效 keep-alive 连接触发的异常（不含 ConnectError/超时类：
+# 新连接建立失败或请求超时，重试无意义）
+_STALE_CONN_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError,
+                      httpx.WriteError)
+
+
+def _client_key(base_url: str, api_key: str = "") -> str:
+    return f"{base_url.rstrip('/')}|{api_key}"
+
+
+def _get_client(base_url: str, api_key: str = "") -> httpx.AsyncClient:
+    """取（或新建）指定服务的共享 AsyncClient。
+
+    timeout 由各调用点按请求传入（请求级覆盖）；此处默认 600s 仅为
+    兜底，防止未来新增调用点忘传 timeout 时被 httpx 默认 5s 误杀。
+    """
+    key = _client_key(base_url, api_key)
+    loop = asyncio.get_running_loop()
+    entry = _client_cache.get(key)
+    if entry is not None:
+        client, created_loop = entry
+        if not client.is_closed and created_loop is loop:
+            return client
+        # client 已关闭或事件循环已更换：旧 loop 通常已关闭、无法安全
+        # aclose，直接丢弃交给 GC
+    client = httpx.AsyncClient(
+        timeout=600.0,
+        limits=httpx.Limits(max_connections=256,
+                            max_keepalive_connections=256,
+                            keepalive_expiry=4.0),
+    )
+    _client_cache[key] = (client, loop)
+    return client
+
+
+def _drop_client(base_url: str, api_key: str = "") -> None:
+    """丢弃缓存的 client（连接疑似失效时），后台异步关闭释放连接。"""
+    entry = _client_cache.pop(_client_key(base_url, api_key), None)
+    if entry is not None and not entry[0].is_closed:
+        try:
+            # 保存 task 引用防止被 GC 中途回收
+            task = asyncio.get_running_loop().create_task(entry[0].aclose())
+            _close_tasks.add(task)
+            task.add_done_callback(_close_tasks.discard)
+        except RuntimeError:
+            pass
 
 
 async def chat_completion(base_url: str, model: str, messages: list,
@@ -44,8 +111,16 @@ async def chat_completion(base_url: str, model: str, messages: list,
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+        client = _get_client(base_url, api_key)
+        try:
+            resp = await client.post(url, json=payload, headers=headers,
+                                     timeout=timeout)
+        except _STALE_CONN_ERRORS:
+            # keep-alive 连接可能已被服务端关闭（uvicorn 默认空闲 5s 断开），
+            # 丢弃后重建连接重试一次
+            _drop_client(base_url, api_key)
+            resp = await _get_client(base_url, api_key).post(
+                url, json=payload, headers=headers, timeout=timeout)
         if resp.status_code == 200:
             data = resp.json()
             content = ""
@@ -131,38 +206,49 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
         headers["Authorization"] = f"Bearer {api_key}"
 
     full = []
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, json=payload,
-                                     headers=headers) as resp:
-                if resp.status_code != 200:
-                    body = (await resp.aread()).decode("utf-8", "replace")
-                    try:
-                        err = json.loads(body)
-                        detail = err.get("error", {}).get("message", "") or body[:200]
-                    except json.JSONDecodeError:
-                        detail = body[:200]
-                    return {"success": False,
-                            "error": f"HTTP {resp.status_code}: {detail}"}
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(data)
-                        delta = obj["choices"][0]["delta"].get("content") or ""
-                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                        continue
-                    if delta:
-                        full.append(delta)
-                        if on_chunk:
-                            try:
-                                on_chunk(delta)
-                            except Exception:
-                                pass
+
+    async def _stream_once(client: httpx.AsyncClient) -> dict:
+        async with client.stream("POST", url, json=payload,
+                                 headers=headers, timeout=timeout) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode("utf-8", "replace")
+                try:
+                    err = json.loads(body)
+                    detail = err.get("error", {}).get("message", "") or body[:200]
+                except json.JSONDecodeError:
+                    detail = body[:200]
+                return {"success": False,
+                        "error": f"HTTP {resp.status_code}: {detail}"}
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0]["delta"].get("content") or ""
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                    continue
+                if delta:
+                    full.append(delta)
+                    if on_chunk:
+                        try:
+                            on_chunk(delta)
+                        except Exception:
+                            pass
         return {"success": True, "content": "".join(full)}
+
+    try:
+        client = _get_client(base_url, api_key)
+        try:
+            return await _stream_once(client)
+        except _STALE_CONN_ERRORS:
+            if full:
+                raise  # 已收到部分数据，重试会导致内容重复
+            # keep-alive 连接可能已被服务端关闭，重建后重试一次
+            _drop_client(base_url, api_key)
+            return await _stream_once(_get_client(base_url, api_key))
     except httpx.TimeoutException as e:
         return {"success": False, "error": f"请求超时（{type(e).__name__}）"}
     except httpx.ConnectError as e:
@@ -251,7 +337,53 @@ def extract_vllm_metrics(raw: dict) -> dict:
         if ttft_sum is not None and ttft_cnt else None,
         "tpot_avg_s": round(tpot_sum / tpot_cnt, 3)
         if tpot_sum is not None and tpot_cnt else None,
+        # 以下原始 counter 供引擎扣除基线（服务启动以来累计值，
+        # 跨测试轮次不归零），重算"本轮测试"的均值/命中率
+        "ttft_sum": ttft_sum,
+        "ttft_cnt": ttft_cnt,
+        "tpot_sum": tpot_sum,
+        "tpot_cnt": tpot_cnt,
+        "pc_hits": pc_hits,
+        "pc_queries": pc_queries,
+        # KV cache 耗尽时被抢占（重算）的请求累计数：
+        # >0 说明并发×生成长度超出 KV 容量，是 TTFT 长尾与
+        # 流式中途停顿的直接信号（详见 doc/metrics.md 案例四）
+        "preemptions_total": find("num_preemptions_total",
+                                  "preemptions_total"),
     }
+
+
+# TTFT 直方图桶行：vllm:time_to_first_token_seconds_bucket{le="0.01"} 5
+_TTFT_BUCKET_RE = re.compile(
+    r'^(?:vllm:)?time_to_first_token_seconds_bucket'
+    r'\{[^}]*\ble="([^"]+)"[^}]*\}\s+(\S+)$')
+
+
+def extract_ttft_buckets(text: str) -> list:
+    """解析 TTFT 直方图桶累计计数，返回按 le 升序的 [(le, count), ...]。
+
+    含 +Inf 桶（le 为 float('inf')）；无直方图数据时返回 []。
+    桶计数为服务启动以来的累计 counter，由引擎扣除本轮基线后，
+    用区间删失 MLE 拟合分位数（修正 histogram_quantile 在宽桶
+    内线性插值的系统性误差）。
+    """
+    buckets: dict = {}
+    for line in text.splitlines():
+        m = _TTFT_BUCKET_RE.match(line.strip())
+        if not m:
+            continue
+        le_raw, val = m.groups()
+        try:
+            le = float(le_raw)
+            count = float(val)
+        except ValueError:
+            continue
+        if math.isnan(count) or math.isinf(count):
+            continue
+        # 同一 le 保留较大值（多实例/重复行时取累计口径最大者）
+        if le not in buckets or count > buckets[le]:
+            buckets[le] = count
+    return sorted(buckets.items())
 
 
 async def fetch_vllm_metrics(base_url: str, api_key: str = "",
@@ -259,19 +391,26 @@ async def fetch_vllm_metrics(base_url: str, api_key: str = "",
     """抓取 vLLM /metrics 并返回提取后的主要指标。
 
     Returns:
-        {"success": True, "metrics": {...}} 或 {"success": False, "error": str}
+        {"success": True, "metrics": {...}, "ttft_buckets": [(le, count), ...]}
+        或 {"success": False, "error": str}
     """
     url = _metrics_url(base_url)
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url, headers=headers)
+        client = _get_client(base_url, api_key)
+        try:
+            resp = await client.get(url, headers=headers, timeout=timeout)
+        except _STALE_CONN_ERRORS:
+            _drop_client(base_url, api_key)
+            resp = await _get_client(base_url, api_key).get(
+                url, headers=headers, timeout=timeout)
         if resp.status_code != 200:
             return {"success": False,
                     "error": f"HTTP {resp.status_code}（{url}）"}
         return {"success": True,
-                "metrics": extract_vllm_metrics(_parse_prometheus(resp.text))}
+                "metrics": extract_vllm_metrics(_parse_prometheus(resp.text)),
+                "ttft_buckets": extract_ttft_buckets(resp.text)}
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {e}"}

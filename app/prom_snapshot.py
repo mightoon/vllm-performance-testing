@@ -65,6 +65,13 @@ METRICS = [
         "unit": "tok/s",
         "promql": "rate(generation_tokens_total[1m]) or rate(vllm:generation_tokens_total[1m])",
     },
+    {
+        "key": "preemptions_rate",
+        "group": "preemption",
+        "legend": "请求抢占速率",
+        "unit": "req/s",
+        "promql": "rate(num_preemptions_total[1m]) or rate(vllm:num_preemptions_total[1m])",
+    },
 ]
 
 
@@ -122,6 +129,9 @@ def _compute_stats(series: list) -> dict:
         "ttft_p95_peak_ms": peak("ttft_p95", 1000.0),
         # kv_cache_usage 原始值为 0-1 小数，换算为百分比
         "kv_cache_peak_perc": peak("kv_cache_usage", 100.0),
+        # 抢占速率峰值：>0 说明测试期间 KV cache 曾耗尽（精确累计
+        # 次数见报告 vLLM 指标区的"累计抢占次数"）
+        "preemptions_rate_peak": peak("preemptions_rate"),
     }
 
 
