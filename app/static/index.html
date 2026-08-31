@@ -114,10 +114,10 @@
         <div class="vllm-bar-title">Profile</div>
         <div class="detail-grid vllm-grid" id="profileBarItems"></div>
       </div>
-      <!-- vLLM 服务端指标条（全局，不区分 case；随状态轮询刷新，不低于 15s 一次） -->
+      <!-- 服务端指标条（全局，不区分 case；报告模式按 业务/技术/资源/统计 分组 -->
       <div class="vllm-bar" id="vllmBar" style="display:none">
-        <div class="vllm-bar-title" id="vllmBarTitle">vLLM 指标</div>
-        <div class="detail-grid vllm-grid" id="vllmBarItems"></div>
+        <div class="vllm-bar-title" id="vllmBarTitle">服务端指标</div>
+        <div id="vllmBarItems"></div>
       </div>
       <div class="progress-list" id="progressList">
         <div class="run-empty" id="runEmpty">暂无运行中的测试</div>

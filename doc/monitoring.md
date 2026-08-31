@@ -140,7 +140,7 @@ PromQL、分组、单位、图例名。**加指标 = 向列表追加条目**（�
 
 ### 后续扩展预留
 
-- DCGM（GPU 利用率/显存）：追加 `gpu` 组条目
+- ~~DCGM（GPU 利用率/显存）：追加 `gpu` 组条目~~ **已实现**：`gpu` 组两条序列——显存使用率 `avg(DCGM_FI_DEV_FB_USED / (FB_USED + FB_FREE)) * 100`、显存控制器使用率 `avg(DCGM_FI_DEV_MEM_COPY_UTIL)`（各卡平均）；stats 预计算 `gpu_fb_usage_avg` / `gpu_mem_copy_util_avg` 供报告"资源指标"组展示
 - 请求成功/失败增量：`increase(request_success_total[1m])` 等
 - 新版 vLLM 指标名前缀（`vllm:*`）：修改 PromQL
 

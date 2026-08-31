@@ -416,6 +416,7 @@ class TextTestEngine:
         for k in ("prompt_tokens_total", "generation_tokens_total",
                   "ttft_sum", "ttft_cnt", "tpot_sum", "tpot_cnt",
                   "prefill_sum", "prefill_cnt", "decode_sum", "decode_cnt",
+                  "e2e_sum", "e2e_cnt",
                   "pc_hits", "pc_queries", "preemptions_total"):
             cur = m.get(k)
             if cur is None:
@@ -442,6 +443,9 @@ class TextTestEngine:
                 and m.get("decode_cnt") is not None):
             m["decode_avg_s"] = (round(m["decode_sum"] / m["decode_cnt"], 3)
                                  if m["decode_cnt"] > 0 else None)
+        if m.get("e2e_sum") is not None and m.get("e2e_cnt") is not None:
+            m["e2e_avg_s"] = (round(m["e2e_sum"] / m["e2e_cnt"], 3)
+                              if m["e2e_cnt"] > 0 else None)
         if m.get("pc_hits") is not None and m.get("pc_queries") is not None:
             m["prefix_cache_hit_rate"] = (
                 round(m["pc_hits"] / m["pc_queries"], 4)
@@ -532,6 +536,10 @@ class TextTestEngine:
                 "prefill_sum", "prefill_cnt", 3, "prefill_avg_s"),
             "decode_avg_s": final_ratio(
                 "decode_sum", "decode_cnt", 3, "decode_avg_s"),
+            # 端到端请求延迟均值（请求等权，终值差分；含 tokenize/
+            # 排队/prefill/decode 全程；旧版 vLLM 无此指标 → 前端 —）
+            "e2e_avg_s": final_ratio(
+                "e2e_sum", "e2e_cnt", 3, "e2e_avg_s"),
             "ttft_p50_fit_s": p50,
             "ttft_p95_fit_s": p95,
             # tokens 为本轮累计 counter（已扣除基线），取最后一次快照

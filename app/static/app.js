@@ -454,6 +454,7 @@ function hideMonitor() {
 /* 加载监控数据：快照优先 → 实时查询兜底 → 无数据占位 */
 async function loadMonitorCharts(taskName, config, result) {
   disposeMonitorCharts();
+  reportGpuStats = null;   // 切换任务先清空，避免残留上一任务的资源指标
   const area = $("monitorArea");
   area.style.display = "block";
   $("monitorCards").innerHTML = "";
@@ -468,6 +469,18 @@ async function loadMonitorCharts(taskName, config, result) {
     return;
   }
   $("monitorSource").textContent = r.source === "live" ? "（实时查询）" : "";
+  // 资源指标（DCGM 显存，各卡平均）：来自快照/实时查询的预计算统计，
+  // 写回指标区"资源指标"组补渲染（renderReport 首渲染时可能尚无数据）
+  const st = r.metrics.stats || {};
+  if (st.gpu_fb_usage_avg != null || st.gpu_mem_copy_util_avg != null) {
+    reportGpuStats = {
+      gpu_fb_usage_avg: st.gpu_fb_usage_avg ?? null,
+      gpu_mem_copy_util_avg: st.gpu_mem_copy_util_avg ?? null,
+    };
+    if (result && result.vllm_metrics_summary) {
+      renderVllmBar(result.vllm_metrics_summary, "report");
+    }
+  }
   renderMonitorCharts(r.metrics, (result || {}).vllm_metrics_summary);
 }
 
@@ -499,8 +512,9 @@ const MONITOR_GROUP_TITLES = {
   throughput: "生成吞吐",
   preemption: "请求抢占（KV cache 耗尽时调度器强制腾位）",
   phase: "Prefill / Decode 阶段耗时",
+  gpu: "GPU 显存（DCGM，各卡平均）",
 };
-const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "phase", "throughput", "preemption"];
+const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "phase", "throughput", "preemption", "gpu"];
 
 function renderMonitorCharts(metrics, summary) {
   const fmt = (v) => v == null ? "—" :
@@ -1203,14 +1217,25 @@ function renderE2eMetrics(c) {
 }
 
 /* vLLM 服务端指标方块（测试状态区域内，全局指标不区分 case；样式与弹窗指标方块一致）
-   mode="live"：运行模式，展示实时快照；
-   mode="report"：报告模式，展示整轮统计（峰值/均值/累计）；
-   mode="legacy"：旧版报告（无统计数据），回退到最后一次快照 */
+   mode="live"：运行模式，展示实时快照（平铺）；
+   mode="report"：报告模式，按 业务/技术/资源/统计 四组展示整轮统计；
+   mode="legacy"：旧版报告（无统计数据），回退到最后一次快照（平铺）
+   资源组（DCGM 显存）数据来自 Prometheus 快照/实时查询，经
+   loadMonitorCharts 写入 reportGpuStats 后补渲染 */
+let reportGpuStats = null;   // {gpu_fb_usage_avg, gpu_mem_copy_util_avg}，各卡平均
+
+function vllmGridHtml(rows) {
+  return '<div class="detail-grid vllm-grid">' + rows.map(([k, v]) =>
+    `<div class="detail-item"><span class="detail-k">${k}</span>` +
+    `<span class="detail-v">${v}</span></div>`).join("") + "</div>";
+}
+
 function renderVllmBar(m, mode = "live") {
   const bar = $("vllmBar");
   const el = $("vllmBarItems");
   bar.style.display = "block";
-  $("vllmBarTitle").textContent = mode === "live" ? "vLLM 指标（快照）" : "vLLM 指标";
+  $("vllmBarTitle").textContent =
+    mode === "live" ? "vLLM 指标（快照）" : "服务端指标";
   if (!m) {
     el.innerHTML = '<div class="detail-item"><span class="detail-v">' +
       (mode === "live" ? "指标采集中…" : "暂无指标数据") + '</span></div>';
@@ -1222,24 +1247,44 @@ function renderVllmBar(m, mode = "live") {
     return;
   }
   const pct = (v) => (v == null ? "—" : (v * 100).toFixed(1) + "%");
+  const pctRaw = (v) => (v == null ? "—" : v.toFixed(1) + "%");   // 原始已是百分比
   const num = (v) => (v == null ? "—" :
     v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
-  const rows = mode === "report" ? [
-    // 整轮统计：请求类取峰值，吞吐/缓存占用取均值；TTFT/TPOT/命中率为
-    // 终值差分（请求等权），tokens/抢占为累计值
-    ["运行中请求峰值", num(m.running_requests_max)],
-    ["排队请求峰值", num(m.waiting_requests_max)],
-    ["平均生成吞吐", m.gen_throughput_toks_avg == null ? "—" : `${num(m.gen_throughput_toks_avg)} tok/s`],
-    ["平均 KV 缓存占用", pct(m.gpu_cache_usage_avg)],
-    ["平均前缀缓存命中", pct(m.prefix_cache_hit_rate_avg)],
-    ["平均首 token 延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
-    ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
-    ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
-    ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
-    ["累计输入 tokens", num(m.prompt_tokens_total)],
-    ["累计生成 tokens", num(m.generation_tokens_total)],
-    ["累计抢占次数", num(m.preemptions_total)],
-  ] : [
+  if (mode === "report") {
+    // 整轮统计四组：业务（时延/并发）→ 技术（引擎/缓存）→ 资源（GPU 显存）
+    // → 统计（token 累计）。请求类取峰值，吞吐/缓存占用取均值；TTFT/TPOT/
+    // E2E/命中率为终值差分（请求等权），tokens/抢占为累计值
+    const g = reportGpuStats || {};
+    const groups = [
+      ["业务指标 · 时延与并发", [
+        ["平均首 token 延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
+        ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
+        ["端到端延迟", m.e2e_avg_s == null ? "—" : `${m.e2e_avg_s} s`],
+        ["运行中请求峰值", num(m.running_requests_max)],
+        ["排队请求峰值", num(m.waiting_requests_max)],
+      ]],
+      ["技术指标 · 吞吐与引擎", [
+        ["平均生成吞吐", m.gen_throughput_toks_avg == null ? "—" : `${num(m.gen_throughput_toks_avg)} tok/s`],
+        ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
+        ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
+        ["平均 KV 缓存占用", pct(m.gpu_cache_usage_avg)],
+        ["平均前缀缓存命中", pct(m.prefix_cache_hit_rate_avg)],
+        ["累计抢占次数", num(m.preemptions_total)],
+      ]],
+      ["资源指标 · GPU 显存（各卡平均）", [
+        ["显存使用率", pctRaw(g.gpu_fb_usage_avg)],
+        ["显存控制器使用率", pctRaw(g.gpu_mem_copy_util_avg)],
+      ]],
+      ["统计指标 · Token 累计", [
+        ["累计输入 tokens", num(m.prompt_tokens_total)],
+        ["累计生成 tokens", num(m.generation_tokens_total)],
+      ]],
+    ];
+    el.innerHTML = groups.map(([title, rows]) =>
+      `<div class="vllm-group-title">${title}</div>` + vllmGridHtml(rows)).join("");
+    return;
+  }
+  const rows = [
     ["运行中请求", num(m.running_requests)],
     ["排队请求", num(m.waiting_requests)],
     ["生成吞吐", m.gen_throughput_toks == null ? "—" : `${num(m.gen_throughput_toks)} tok/s`],
@@ -1249,13 +1294,12 @@ function renderVllmBar(m, mode = "live") {
     ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
     ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
     ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
+    ["端到端延迟", m.e2e_avg_s == null ? "—" : `${m.e2e_avg_s} s`],
     ["累计输入 tokens", num(m.prompt_tokens_total)],
     ["累计生成 tokens", num(m.generation_tokens_total)],
     ["累计抢占次数", num(m.preemptions_total)],
   ];
-  el.innerHTML = rows.map(([k, v]) =>
-    `<div class="detail-item"><span class="detail-k">${k}</span>` +
-    `<span class="detail-v">${v}</span></div>`).join("");
+  el.innerHTML = vllmGridHtml(rows);
 }
 
 

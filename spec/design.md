@@ -341,7 +341,7 @@ for i, noun in enumerate(nouns):
 ### 5.4 报告模式
 
 1. 历史列表（`GET /api/tests/text/history`）选择任务 → `GET /api/tests/text/history/{name}` 取 config+result。
-2. 渲染：测试参数回显、e2e 汇总（总调用/错误/字符/时长/各分位）、vLLM 指标汇总卡（终值差分口径）。
+2. 渲染：测试参数回显、e2e 汇总（总调用/错误/字符/时长/各分位）、服务端指标区（标题"服务端指标"，按**业务/技术/资源/统计**四组展示：业务=时延与并发（TTFT/TPOT/E2E 均值+请求峰值）、技术=吞吐与引擎（吞吐/Prefill/Decode/KV 占用/命中率/抢占）、资源=GPU 显存（DCGM 各卡平均，数据来自 Prometheus 快照/实时查询的 stats，经 `loadMonitorCharts` 写入 `reportGpuStats` 补渲染）、统计=token 累计）。
 3. **Profile 区域**（`#profileBar`，位于汇总行与 vLLM 指标条之间，仅报告模式显示）：展示**启动时刻**的快照记录——模型名（跨全列）+ 当时探测的 vLLM 版本 / 最大上下文 / KV cache 容量（`config.model_probe`，`fmtTokens` 缩写格式与探测条一致）+ 迭代次数 / 输入长度（中文档位标签）/ 输出长度 / 并发度（`config.params`）。数据全部来自 config 持久化，不随实时探测变化；旧任务无 `model_probe` 字段时对应项显示 "—"。运行模式各渲染路径（`renderStatus`、新测试、启动测试、轮询空态）统一隐藏该区域。
 4. 监控图表：`GET .../history/{name}/metrics`（三级回退，见 §4.1）→ 按 group 渲染 5 组 ECharts 时序图（并发/缓存/延迟/吞吐/抢占），x 轴为时间，支持 dataZoom。
 5. Grafana 链接：配置了 grafana_url 时提供跳转链接（带时间范围参数）。
@@ -407,7 +407,7 @@ case 吞吐     = e2e_chars / e2e_gen_time         # 字符/秒（不含 TTFT，
 
 ### 6.3 vLLM 服务端指标（轮询 + 差分）
 
-**`extract_vllm_metrics` 提取的 15 个字段**（两轮名称匹配兼容新旧版本）：
+**`extract_vllm_metrics` 提取的字段**（两轮名称匹配兼容新旧版本）：
 
 | 字段 | vLLM 指标 | 类型 |
 |---|---|---|
@@ -419,6 +419,9 @@ case 吞吐     = e2e_chars / e2e_gen_time         # 字符/秒（不含 TTFT，
 | `generation_tokens_total` | generation_tokens_total | counter |
 | `ttft_sum` / `ttft_count` | time_to_first_token_seconds_sum/_count | counter |
 | `tpot_sum` / `tpot_count` | time_per_output_token_seconds_sum/_count | counter |
+| `prefill_sum` / `prefill_cnt` | request_prefill_time_seconds_sum/_count | counter |
+| `decode_sum` / `decode_cnt` | request_decode_time_seconds_sum/_count | counter |
+| `e2e_sum` / `e2e_cnt` | e2e_request_latency_seconds_sum/_count（较新 vLLM） | counter |
 | `prefix_hits` / `prefix_queries` | prefix_cache_hits/queries_total | counter |
 | `preemptions_total` | preemptions_total | counter |
 | `requeue_total` | requeue_requests_total | counter |
@@ -428,8 +431,8 @@ case 吞吐     = e2e_chars / e2e_gen_time         # 字符/秒（不含 TTFT，
 1. **TTFT 桶基线差分**：`extract_ttft_buckets` 得到的是 histogram **累计计数**，直接用会把 vLLM 启动以来的历史都算进来。引擎记录首轮桶为基线 `ttft_bucket_base`，每轮用 `cur - base` 得到**本轮测试新增分布**。
 2. **vLLM 重启检测**：若 `cur < base`（counter 回绕=服务重启），重新校准基线为当前值。
 3. **gen_throughput_toks 差分**：新版 vLLM 移除了 gauge 型吞吐指标，改为对 `generation_tokens_total` 做 `(cur - last) / dt` 差分求瞬时吞吐。
-4. **9 个 counter 基线差分**：`prompt_tokens_total`、`generation_tokens_total`、`ttft_sum/count`、`tpot_sum/count`、`prefix_hits/queries`、`preemptions_total`、`requeue_total` 同样记录基线，每轮差分。
-5. **重算本轮均值**：`ttft_avg_s = Δttft_sum / Δttft_count`（差分后的均值才是**本轮**请求的均值，而非 vLLM 启动以来的累计均值）；`prefix_cache_hit_rate = Δhits / Δqueries`。
+4. **counter 基线差分**：`prompt_tokens_total`、`generation_tokens_total`、`ttft/tpot/prefill/decode/e2e` 的 sum/count、`prefix_hits/queries`、`preemptions_total`、`requeue_total` 同样记录基线，每轮差分。
+5. **重算本轮均值**：`ttft_avg_s = Δttft_sum / Δttft_count`（差分后的均值才是**本轮**请求的均值，而非 vLLM 启动以来的累计均值）；`e2e_avg_s`、`prefill/decode_avg_s` 同理；`prefix_cache_hit_rate = Δhits / Δqueries`。
 
 **`_accumulate_metrics_stats`（时间平均与峰值）**：
 

@@ -105,6 +105,25 @@ METRICS = [
         "promql": "histogram_quantile(0.95, sum by (le) (rate(request_decode_time_seconds_bucket[30s]))) "
                   "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[30s])))",
     },
+    # DCGM GPU 显存指标（dcgm-exporter 暴露，非 vLLM）：
+    # - 显存使用率：每卡 FB_USED/(USED+FREE) 后跨卡平均（各卡等权）
+    # - 显存控制器使用率：MEM_COPY_UTIL（即 nvidia-smi 的 Memory-Util%）
+    # 未部署 dcgm-exporter 时查询无数据，自动跳过
+    {
+        "key": "gpu_fb_usage",
+        "group": "gpu",
+        "legend": "显存使用率",
+        "unit": "%",
+        "promql": "avg(DCGM_FI_DEV_FB_USED / "
+                  "(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)) * 100",
+    },
+    {
+        "key": "gpu_mem_copy_util",
+        "group": "gpu",
+        "legend": "显存控制器使用率",
+        "unit": "%",
+        "promql": "avg(DCGM_FI_DEV_MEM_COPY_UTIL)",
+    },
 ]
 
 
@@ -165,6 +184,10 @@ def _compute_stats(series: list) -> dict:
         # 抢占速率峰值：>0 说明测试期间 KV cache 曾耗尽（精确累计
         # 次数见报告 vLLM 指标区的"累计抢占次数"）
         "preemptions_rate_peak": peak("preemptions_rate"),
+        # DCGM GPU 显存（各卡平均，报告"资源指标"组展示；
+        # 序列原始值已是 0-100 百分比）
+        "gpu_fb_usage_avg": avg("gpu_fb_usage"),
+        "gpu_mem_copy_util_avg": avg("gpu_mem_copy_util"),
     }
 
 

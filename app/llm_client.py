@@ -319,6 +319,10 @@ def extract_vllm_metrics(raw: dict) -> dict:
     prefill_cnt = find("request_prefill_time_seconds_count")
     decode_sum = find("request_decode_time_seconds_sum")
     decode_cnt = find("request_decode_time_seconds_count")
+    # 端到端请求延迟：请求到达前端（开始 tokenize）→ 收到最后
+    # 一个 token，含排队/prefill/decode 全过程（较新 vLLM 才暴露）
+    e2e_sum = find("e2e_request_latency_seconds_sum")
+    e2e_cnt = find("e2e_request_latency_seconds_count")
     # 前缀缓存命中：新版 vLLM 是 hits/queries 两个 counter，旧版是现成 rate gauge
     pc_hits = find("prefix_cache_hits_total")
     pc_queries = find("prefix_cache_queries_total")
@@ -346,6 +350,8 @@ def extract_vllm_metrics(raw: dict) -> dict:
         if prefill_sum is not None and prefill_cnt else None,
         "decode_avg_s": round(decode_sum / decode_cnt, 3)
         if decode_sum is not None and decode_cnt else None,
+        "e2e_avg_s": round(e2e_sum / e2e_cnt, 3)
+        if e2e_sum is not None and e2e_cnt else None,
         # 以下原始 counter 供引擎扣除基线（服务启动以来累计值，
         # 跨测试轮次不归零），重算"本轮测试"的均值/命中率
         "ttft_sum": ttft_sum,
@@ -356,6 +362,8 @@ def extract_vllm_metrics(raw: dict) -> dict:
         "prefill_cnt": prefill_cnt,
         "decode_sum": decode_sum,
         "decode_cnt": decode_cnt,
+        "e2e_sum": e2e_sum,
+        "e2e_cnt": e2e_cnt,
         "pc_hits": pc_hits,
         "pc_queries": pc_queries,
         # KV cache 耗尽时被抢占（重算）的请求累计数：

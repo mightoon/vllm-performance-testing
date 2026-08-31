@@ -2,9 +2,20 @@
 
 本文档说明测试系统中三种指标统计体系的数据源、计算方式、优点与局限性，用于解读测试报告时区分口径差异。
 
-- **vLLM 指标区**：测试状态区（实时）与测试报告区（整轮汇总）
+- **服务端指标区**：测试状态区（实时，标题"vLLM 指标（快照）"）与测试报告区（整轮汇总，标题"服务端指标"，按 业务/技术/资源/统计 四组展示）
 - **监控区**：Prometheus 快照时序图与统计卡片
 - **case e2e 统计**：每个 case 弹窗中的端到端性能
+
+报告模式四组划分：
+
+| 分组 | 指标 | 数据源 |
+|---|---|---|
+| 业务指标 · 时延与并发 | 平均首 token/逐 token/端到端延迟、运行中/排队请求峰值 | vLLM counter 差分 |
+| 技术指标 · 吞吐与引擎 | 平均生成吞吐、Prefill/Decode 耗时、KV 缓存占用、前缀缓存命中、累计抢占 | vLLM counter 差分 |
+| 资源指标 · GPU 显存 | 显存使用率、显存控制器使用率（各卡平均） | Prometheus（DCGM，快照/实时查询 stats） |
+| 统计指标 · Token 累计 | 累计输入/生成 tokens | vLLM counter 差分 |
+
+其中端到端延迟来自 vLLM `e2e_request_latency_seconds`（请求到达前端 → 收到最后一个 token，含 tokenize/排队全程，较新 vLLM 才暴露）；资源指标两个显存项来自 dcgm-exporter（`DCGM_FI_DEV_FB_USED/(USED+FREE)` 与 `DCGM_FI_DEV_MEM_COPY_UTIL`），非 vLLM 暴露，Prometheus 不可达或未部署 dcgm-exporter 时显示 "—"。
 
 ---
 
