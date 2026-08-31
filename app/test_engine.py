@@ -56,13 +56,14 @@ class CaseState:
         })
 
     def begin_qa(self, phase: str, *, loop: int = 0, noun: str = "",
-                 question: str = "") -> dict:
+                 question: str = "", prompt_chars: int = 0) -> dict:
         """开始一次问答：追加记录并返回引用（流式期间更新其 partial 字段）。"""
         qa = {
             "phase": phase,           # 生成文章
             "loop": loop,             # 第几轮
             "noun": noun,
-            "question": question,     # 发给 LLM 的完整 prompt
+            "question": question,     # 发给 LLM 的 prompt（超长档为截断存储）
+            "prompt_chars": prompt_chars,  # 完整 prompt 字数（截断前的真实长度）
             "answer": "",             # 完成后的完整回答
             "partial": "",            # 流式进行中的增量文本（完成后清空）
             "status": "generating",   # generating/done/error
@@ -176,7 +177,8 @@ class TextTestEngine:
     # ---------- 启动 / 停止 ----------
 
     def start(self, model_id: str, noun_count: int, article_length: int,
-              concurrency: int, input_length: str = "tiny") -> dict:
+              concurrency: int, input_length: str = "tiny",
+              probe: dict | None = None) -> dict:
         if self.status == "running":
             return {"success": False, "error": "测试已在运行中，请先停止"}
         model = model_store.get_model(model_id)
@@ -238,6 +240,10 @@ class TextTestEngine:
                 "model": model.get("model", ""),
                 "url": model.get("url", ""),
             },
+            # 启动时刻的服务端参数快照（报告模式 Profile 区域数据源）。
+            # 与实时探测解耦：测试后服务端配置变化不影响历史报告展示；
+            # 探测失败为 None，旧任务无此字段，前端均显示 "—"
+            "model_probe": probe,
         })
         return {"success": True, "test_id": self.test_id, "task_name": self.task_name}
 
@@ -670,9 +676,11 @@ class TextTestEngine:
                     self.params["article_length"])
                 # 流式生成：on_chunk 实时更新 qa["partial"]，
                 # 前端详情弹窗轮询时即可看到"LLM 正在回复"的流式效果。
-                # question 截断存储：超长档全文 2.7 万字，仅存首尾避免 result.json 膨胀
+                # question 截断存储：超长档全文 2.7 万字，仅存首尾避免 result.json 膨胀；
+                # prompt_chars 记录截断前真实长度，供前端展示输入规模
                 qa = case.begin_qa("生成文章", loop=i + 1, noun=noun,
-                                   question=prompt_templates.truncate_for_store(prompt))
+                                   question=prompt_templates.truncate_for_store(prompt),
+                                   prompt_chars=len(prompt))
 
                 def _on_chunk(delta: str, _qa=qa) -> None:
                     now = time.time()
@@ -687,7 +695,9 @@ class TextTestEngine:
                     base_url=model["url"], model=model["model"],
                     messages=[{"role": "user", "content": prompt}],
                     api_key=api_key,
-                    max_tokens=max(2048, self.params["article_length"] * 2),
+                    # article_length 单位为 token：上限留 50% 余量，
+                    # 防止模型略微超出目标字数时被 max_tokens 截断
+                    max_tokens=max(2048, int(self.params["article_length"] * 1.5)),
                     timeout=600.0,
                     on_chunk=_on_chunk,
                 )

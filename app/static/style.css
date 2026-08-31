@@ -224,10 +224,43 @@ body {
 .param-card h3 { font-size: 15px; margin-bottom: 16px; }
 
 .param-grid {
-  display: grid;
-  /* 5 参数框一行：5×200px + 4×16px gap ≈ 1064px，1366 屏亦可容纳 */
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 16px;
+}
+
+/* 参数行：4 等分列。模型行仅 1 项占首列（约 1/4 宽），与第二行首列对齐 */
+.param-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+/* 窄屏回退为 2 列，避免输入框过窄 */
+@media (max-width: 900px) {
+  .param-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* 模型服务端参数探测信息条：占模型行剩余 3/4 宽，与下拉框底部对齐 */
+.model-info {
+  grid-column: 2 / -1;
+  align-self: end;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 9px 14px;
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-sub);
+  min-height: 38px;
+}
+.model-info b { color: var(--text); font-weight: 600; margin-left: 4px; }
+.model-info .info-sep { color: var(--border); }
+@media (max-width: 900px) {
+  .model-info { grid-column: 1 / -1; }
 }
 
 .param-item label {
@@ -357,6 +390,15 @@ body {
 .detail-grid.vllm-grid {
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   gap: 8px;
+}
+/* Profile 区域：8 项固定 4 列，恰好两行——
+   第一行：模型 + 服务端参数（vLLM 版本 / 最大上下文 / KV cache 容量）；
+   第二行：测试参数（迭代次数 / 输入长度 / 输出长度 / 并发度） */
+.profile-bar .detail-grid.vllm-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+@media (max-width: 900px) {
+  .profile-bar .detail-grid.vllm-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .run-empty {
@@ -842,6 +884,9 @@ body {
 }
 
 .qa-answer.streaming { color: #4a5262; }
+/* 截断存储标记：红色加粗，提示此处为存储省略而非 prompt 原文 */
+.qa-omitted { color: var(--danger); font-weight: 700; }
+
 .qa-answer.qa-err { color: var(--danger); font-size: 13px; }
 
 /* ---- Markdown 渲染后的内容样式（marked 输出） ---- */

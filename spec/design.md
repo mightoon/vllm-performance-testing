@@ -150,6 +150,8 @@ cb_vLLM_testing/
 2. **实时查询**：无快照但有 Prometheus 配置时，按 `config.started_at + result.elapsed` 重算起止窗口调 `fetch_snapshot`（受 15 天保留期限制）；
 3. **空数据**：返回 `{source: null, metrics: null}`，前端展示"无监控数据"。
 
+**模型服务端参数探测**（`GET /api/models/{model_id}/probe`）：调用 `llm_client.probe_model_info` 探测 vLLM 版本 / 最大上下文 / KV cache 容量（原理见 §4.3），结果按配置指纹内存缓存——`_probe_cache[model_id] = {fingerprint: (url, model, api_key), data}`，指纹变化（编辑了服务地址/模型 ID/Key）自动失效重探，切换模型不重复探测。探测逻辑提取为 `_probe_model_cached()` 辅助函数，**测试启动接口复用同一缓存**：`POST /api/tests/text/start` 启动前快照一份探测结果随任务持久化（见 §4.4），前端选模型时已探测过故通常命中缓存零开销；探测失败不阻塞启动（快照为 null）。
+
 ### 4.2 `model_store.py` — 模型配置持久化
 
 - 存储：项目根 `config.json`，结构 `{"models": [...], "prometheus": {url, grafana_url}}`，读写全程持线程锁。
@@ -188,6 +190,24 @@ _client_cache: dict  # key = f"{base_url}|{api_key}" -> (AsyncClient, 创建时�
 - `extract_ttft_buckets(text)`：正则解析 TTFT 直方图桶累计计数 `time_to_first_token_seconds_bucket{le="..."}`，返回按 le 升序的 `[(le, count)]`（含 +Inf 桶）；同 le 多行取较大值（多实例场景取累计口径最大者）。
 - `fetch_vllm_metrics()`：GET `/metrics`（timeout 10s），返回 `{success, metrics, ttft_buckets}`。
 
+#### 服务端能力探测（probe_model_info）
+
+选中模型后前端调 `GET /api/models/{id}/probe`（main.py 按指纹缓存，见 §4.1），后端独立探测三项服务端能力，单项失败仅该项为 `None`，互不阻塞：
+
+| 探测项 | 方法 | 原理与兼容性 |
+|---|---|---|
+| vLLM 版本 | `GET /version` | vLLM v0.8+ 提供 JSON `{"version": "..."}`；非 vLLM 服务通常 404 → None |
+| KV cache 容量 | `GET /metrics` → `cache_config_info` gauge 的 labels | 正则解析 label 键值对。**新版 vLLM 直接暴露 `kv_cache_size_tokens`（服务端自报口径，优先取）**；旧版无此 label 时回退 `num_gpu_blocks × block_size` 推算。混合架构（如 mamba+attention，block_size 为非常规值 784）下两者存在偏差，以自报值为准 |
+| 最大上下文长度 | 试探请求 | 发送 `max_tokens=10000000` 的最小 chat 请求（`"hi"`），服务端在**参数校验阶段**直接返回 4xx 拒绝——不进调度器、不消耗 GPU，从错误信息中解析上限 |
+
+**最大上下文的多格式解析**（`_MAX_LEN_PATTERNS`）：错误信息格式随服务端版本/实现演进，依次尝试三种正则，命中即止：
+
+1. OpenAI / 旧版 vLLM：`This model's maximum context length is 8192 tokens. However, you requested ...`
+2. 新版 vLLM（0.2x，实测 0.27.1）：`max_tokens=10000000 cannot be greater than max_model_len=max_total_tokens=262144. Please request fewer output tokens.`
+3. 其他变体：`max_model_len=8192` / `max_model_len: 8192`
+
+状态码同时接受 400/422（不同实现在参数校验失败时返回码不同）。
+
 ### 4.4 `test_engine.py` — 测试引擎（业务核心）
 
 #### 状态机
@@ -207,7 +227,7 @@ qa:    generating ──▶ done | error
 3. **全局名词池**：`pick_nouns_pool(noun_count × concurrency)`——总量 ≤ 2000（词库规模）时无放回抽样全局互不重复，各 case 取**不重叠分片**（case i 取 `[i*n, (i+1)*n)`）；超过时随机有放回，数量仍严格等于总量。
 4. **错峰启动（ramp-up）**：`stagger = min(2.0, max(0.15, 10.0/(concurrency-1)))`，case i 延迟 `i × stagger`，总启动窗口控制在 ~10s，避免所有线程首请求同时打满服务器造成 prefill 风暴。
 5. 启动 `_poll_vllm_metrics` 后台任务（每 5s）。
-6. **启动即持久化** `workspace/<task_name>/config.json`（参数 + 模型快照 + started_at），结束后由 `_wait_all` 写 result——即使进程中途崩溃也能从 config 看到未完成任务。
+6. **启动即持久化** `workspace/<task_name>/config.json`（参数 + 模型快照 + `model_probe` 服务端参数快照 + started_at），结束后由 `_wait_all` 写 result——即使进程中途崩溃也能从 config 看到未完成任务。`model_probe` 为启动时刻探测的 vLLM 版本/最大上下文/KV 容量（由 main.py 启动接口探测后传入，见 §4.1），是报告模式 Profile 区域的数据源；与实时探测解耦，测试后服务端配置变化不影响历史报告。
 
 #### `_wait_rampup` — 自适应顺延
 
@@ -274,7 +294,9 @@ for i, noun in enumerate(nouns):
 
 1. **顶栏**：平台标题 + 副标题；右侧"历史报告"入口按钮。
 2. **模型区**：模型下拉选择框（显示 name）+ "模型管理"按钮（打开管理弹窗）。
-3. **参数区**：三个数字输入框（名词数量/文章字数/并发度）+ "开始测试"（主按钮）/"停止"按钮。
+3. **参数区**（两行网格）：
+   - 第一行：模型配置下拉框（占 1/4 宽）+ **服务端参数探测条**（占余下 3/4，见 5.5）；
+   - 第二行：迭代次数（每 Thread）/ 输入长度（token）/ 输出长度（token）/ 并发度四个输入项 + "运行测试"/"停止"按钮。
 4. **运行状态区**：
    - 汇总卡片行：总调用数、错误数、总字符数、已用时间等；
    - vLLM 实时指标卡：running/waiting、KV cache 使用率、生成吞吐、TTFT/TPOT 均值、prefix cache 命中率等（有数据才渲染）。
@@ -320,8 +342,24 @@ for i, noun in enumerate(nouns):
 
 1. 历史列表（`GET /api/tests/text/history`）选择任务 → `GET /api/tests/text/history/{name}` 取 config+result。
 2. 渲染：测试参数回显、e2e 汇总（总调用/错误/字符/时长/各分位）、vLLM 指标汇总卡（终值差分口径）。
-3. 监控图表：`GET .../history/{name}/metrics`（三级回退，见 §4.1）→ 按 group 渲染 5 组 ECharts 时序图（并发/缓存/延迟/吞吐/抢占），x 轴为时间，支持 dataZoom。
-4. Grafana 链接：配置了 grafana_url 时提供跳转链接（带时间范围参数）。
+3. **Profile 区域**（`#profileBar`，位于汇总行与 vLLM 指标条之间，仅报告模式显示）：展示**启动时刻**的快照记录——模型名（跨全列）+ 当时探测的 vLLM 版本 / 最大上下文 / KV cache 容量（`config.model_probe`，`fmtTokens` 缩写格式与探测条一致）+ 迭代次数 / 输入长度（中文档位标签）/ 输出长度 / 并发度（`config.params`）。数据全部来自 config 持久化，不随实时探测变化；旧任务无 `model_probe` 字段时对应项显示 "—"。运行模式各渲染路径（`renderStatus`、新测试、启动测试、轮询空态）统一隐藏该区域。
+4. 监控图表：`GET .../history/{name}/metrics`（三级回退，见 §4.1）→ 按 group 渲染 5 组 ECharts 时序图（并发/缓存/延迟/吞吐/抢占），x 轴为时间，支持 dataZoom。
+5. Grafana 链接：配置了 grafana_url 时提供跳转链接（带时间范围参数）。
+
+### 5.5 模型服务端参数探测条
+
+选中模型后自动探测服务端关键配置（调 `GET /api/models/{id}/probe`），展示在参数区第一行模型下拉框右侧（`#modelInfo`，grid 占 `2 / -1` 列，与下拉框底部对齐，虚线边框弱化视觉层级）：
+
+```
+vLLM 版本: 0.27.1 │ 最大上下文: 256K token │ KV cache 容量: 385.5K token
+```
+
+- **触发时机**：模型下拉框 `change`、页面初始化时已有选中模型、报告模式加载历史模型后（探测条反映该模型**当前**的服务端状态，与 Profile 区域的启动时刻快照互补）；「新测试」清空模型时隐藏探测条并复位并发度 label。
+- **过期响应防护**：`probeSeq` 自增序号，异步响应返回时与当前序号不符则丢弃——快速切换模型时防止旧模型的响应覆盖新状态。
+- **token 数缩写**（`fmtTokens`）：≥ 1M（1024²）显示 `x百万`、≥ 1K（1024）显示 `xK`；恰为整数不带小数位，否则保留一位（8K / 256K / 3.3百万）。采用 **1024 进制**（LLM 行业惯例：262144 → 256K 而非 262.1K）。
+- **视觉格式**：参数名与值之间加冒号，值加粗（`<b>`）；参数间竖线 `│`（`.info-sep`，取浅色 `--border` 弱化，间距 10px）。
+- **并发度预估 hint**：有 KV 容量数据时，并发度 label 变为 `并发度（预估最大 ~N）`，`N = KV 容量 ÷ (输入长度档位 token 数 + 输出长度)`，随输入/输出长度联动刷新——帮助用户启动前判断并发是否超出 KV 容量（输入档位 → token 数映射：tiny 10 / short 100 / medium 1000 / long 8000 / xlong 16000）。
+- 探测失败（非 vLLM 服务或网络错误）显示"服务端参数不可用"，不阻塞测试流程。
 
 ---
 
@@ -463,7 +501,7 @@ case 吞吐     = e2e_chars / e2e_gen_time         # 字符/秒（不含 TTFT，
 
 | 文件 | 写入时机 | 内容 |
 |---|---|---|
-| `config.json` | 测试启动时 | 参数（noun_count/article_length/concurrency）+ 模型快照 + started_at |
+| `config.json` | 测试启动时 | 参数（noun_count/article_length/concurrency）+ 模型快照 + `model_probe`（启动时刻探测的 vLLM 版本/最大上下文/KV 容量）+ started_at |
 | `result.json` | 测试结束时 | 引擎状态、各 case 详情（含 qa_history、e2e 计时）、错误明细、vLLM 指标汇总（含 TTFT 拟合分位） |
 | `metrics.json` | 测试结束后异步 | Prometheus 快照（schema_version/source/range/series/stats） |
 
@@ -483,12 +521,13 @@ case 吞吐     = e2e_chars / e2e_gen_time         # 字符/秒（不含 TTFT，
 | DELETE | `/api/models/{id}` | 删除 |
 | GET | `/api/models/{id}/apikey` | 单独获取明文 Key（编辑回显用） |
 | POST | `/api/verify-model` | 验证连接（非流式 chat，timeout 30s） |
+| GET | `/api/models/{id}/probe` | 探测服务端配置（vLLM 版本/最大上下文/KV 容量，指纹缓存，见 §4.3） |
 
 ### 文本测试
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/tests/text/start` | 启动（running 中返回 409） |
+| POST | `/api/tests/text/start` | 启动（running 中返回 409）；启动前快照模型探测结果随任务持久化 |
 | GET | `/api/tests/text/status` | 引擎状态 + 汇总 + vLLM 指标 + case 列表（轮询 2s） |
 | POST | `/api/tests/text/stop` | 停止（asyncio.Event 广播） |
 | GET | `/api/tests/text/case/{id}` | case 详情（含 qa_history） |
@@ -525,7 +564,10 @@ case 吞吐     = e2e_chars / e2e_gen_time         # 字符/秒（不含 TTFT，
 8. **监控三级回退（快照→实时→空）**：快照永久可回放但依赖测试时已配置；实时查询覆盖"补配置"场景；空数据优雅降级。
 9. **名词池防 prefix cache 干扰**：prompt 主体互不相同，测的是裸性能而非缓存命中性能。
 10. **错峰启动 + 排队自适应顺延**：避免人为 prefill 风暴扭曲首轮 TTFT，同时防止服务器过载时雪崩。
+11. **试探请求探测 max_model_len**：发送 max_tokens 超大的最小请求，被服务端在参数校验阶段直接拒绝（不进调度、不消耗 GPU），从 4xx 错误信息多格式解析上限——OpenAI 兼容服务通用，不依赖 vLLM 专属 API；代价是错误信息格式随版本演进需持续兼容（`_MAX_LEN_PATTERNS` 三模式，实测 0.27.1 已换用 `max_total_tokens=` 格式）。
+12. **探测结果指纹缓存**：按 (url, model, api_key) 缓存，配置变更自动失效——避免每次切换模型都发 3 个探测请求（其中试探请求虽不耗 GPU 但有网络往返）。
+13. **启动快照与实时探测分离**：测试场景区的探测条始终反映模型**当前**服务端状态（辅助配置下一轮测试），而报告模式 Profile 区域展示**启动时刻**的探测快照（随 config.json 持久化）——测试后服务端改配置（如重启换 `--max-model-len`）不会篡改历史报告的记录口径；代价是旧任务无 `model_probe` 字段需显示 "—" 兜底。
 
 ---
 
-*文档生成于 2026-08-28，对应代码版本：main 分支（app/ 7 模块 + 前端三件套）。*
+*文档生成于 2026-08-28；2026-08-31 增补：模型服务端能力探测（§4.1/§4.3/§5.5/§8/§9）、报告模式 Profile 快照区（§4.1/§4.4/§5.4/§8/§9）。对应代码版本：main 分支。*

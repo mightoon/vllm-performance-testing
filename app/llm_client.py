@@ -399,6 +399,139 @@ def extract_ttft_buckets(text: str) -> list:
     return sorted(buckets.items())
 
 
+# ---------------------------------------------------------------------------
+# 模型服务端能力探测（vLLM 版本 / 最大上下文长度 / KV cache 容量）
+# ---------------------------------------------------------------------------
+
+def _root_url(base_url: str) -> str:
+    """从 chat base_url 推导服务根地址（依次剥离 /chat/completions 与 /v1）。"""
+    url = base_url.rstrip("/")
+    for suffix in ("/chat/completions", "/v1"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url.rstrip("/")
+
+
+# cache_config_info 行（值为 1，配置在 labels 中）：
+#   vllm:cache_config_info{block_size="16",...,num_gpu_blocks="98304",...} 1
+_CACHE_CONFIG_RE = re.compile(
+    r'^(?:vllm:)?cache_config_info\{([^}]*)\}\s+\S+', re.MULTILINE)
+_LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
+
+# 最大上下文长度：试探请求（max_tokens 超大）被拒时的错误信息格式，
+# 随服务端版本/实现而异，依次尝试：
+_MAX_LEN_PATTERNS = (
+    # OpenAI / 旧版 vLLM："This model's maximum context length is
+    # 8192 tokens. However, you requested ..."
+    re.compile(r"maximum context length is (\d+) tokens"),
+    # 新版 vLLM（0.2x）："max_tokens=10000000 cannot be greater than
+    # max_model_len=max_total_tokens=262144. Please request fewer
+    # output tokens."
+    re.compile(r"max_total_tokens=(\d+)"),
+    # 其他变体：直接给出 max_model_len=8192
+    re.compile(r"max_model_len[=: ]+(\d+)"),
+)
+
+
+def _parse_cache_config(text: str) -> dict:
+    """从 /metrics 原文解析 cache_config_info gauge 的 labels。"""
+    m = _CACHE_CONFIG_RE.search(text)
+    if not m:
+        return {}
+    return dict(_LABEL_RE.findall(m.group(1)))
+
+
+async def probe_model_info(base_url: str, model: str, api_key: str = "",
+                           timeout: float = 15.0) -> dict:
+    """探测服务端关键配置：vLLM 版本 / 最大上下文长度 / KV cache 容量。
+
+    - 版本：GET /version（vLLM v0.8+；非 vLLM 服务通常 404 → None）
+    - KV 容量：/metrics 的 cache_config_info labels
+      （新版直接取 kv_cache_size_tokens；旧版用 num_gpu_blocks ×
+      block_size 推算，单位 token；非 vLLM 服务无此指标 → None）
+    - 最大上下文：发送 max_tokens 超大的试探请求，从 4xx 错误信息中
+      解析（OpenAI 兼容服务通用，格式见 _MAX_LEN_PATTERNS；请求被
+      服务端立即拒绝，不消耗 GPU）
+
+    各项独立探测、互不阻塞，单项失败仅该项为 None。
+
+    Returns:
+        {"success": True, "version": str|None, "max_model_len": int|None,
+         "kv_cache_tokens": int|None}
+    """
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    root = _root_url(base_url)
+    version = None
+    kv_tokens = None
+
+    async def _get(url: str):
+        client = _get_client(base_url, api_key)
+        try:
+            return await client.get(url, headers=headers, timeout=timeout)
+        except _STALE_CONN_ERRORS:
+            _drop_client(base_url, api_key)
+            return await _get_client(base_url, api_key).get(
+                url, headers=headers, timeout=timeout)
+
+    # 1) vLLM 版本
+    try:
+        resp = await _get(root + "/version")
+        if resp.status_code == 200:
+            try:
+                v = resp.json().get("version")
+                if isinstance(v, str) and v:
+                    version = v
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) KV cache 容量：新版 vLLM 直接给 kv_cache_size_tokens label；
+    #    旧版无此 label，用 num_gpu_blocks × block_size 推算
+    try:
+        resp = await _get(root + "/metrics")
+        if resp.status_code == 200:
+            cfg = _parse_cache_config(resp.text)
+            try:
+                kv_tokens = int(cfg["kv_cache_size_tokens"])
+            except (KeyError, ValueError):
+                kv_tokens = None
+            if not kv_tokens:
+                try:
+                    kv_tokens = (int(cfg["num_gpu_blocks"])
+                                 * int(cfg["block_size"]))
+                except (KeyError, ValueError):
+                    kv_tokens = None
+    except Exception:
+        pass
+
+    # 3) 最大上下文长度：试探请求（服务端校验后直接 4xx 拒绝，不执行推理），
+    #    错误信息格式见 _MAX_LEN_PATTERNS
+    max_model_len = None
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url = url + "/chat/completions"
+    payload = {"model": model,
+               "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 10000000, "stream": False}
+    try:
+        resp = await _get_client(base_url, api_key).post(
+            url, json=payload, headers=headers, timeout=timeout)
+        if resp.status_code in (400, 422):
+            for pat in _MAX_LEN_PATTERNS:
+                m = pat.search(resp.text)
+                if m:
+                    max_model_len = int(m.group(1))
+                    break
+    except Exception:
+        pass
+
+    return {"success": True, "version": version,
+            "max_model_len": max_model_len, "kv_cache_tokens": kv_tokens}
+
+
 async def fetch_vllm_metrics(base_url: str, api_key: str = "",
                              timeout: float = 10.0) -> dict:
     """抓取 vLLM /metrics 并返回提取后的主要指标。

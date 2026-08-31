@@ -82,6 +82,45 @@ async def api_verify_model(payload: ModelPayload):
                                    payload.api_key or "")
 
 
+# ==================== 模型服务端能力探测 ====================
+
+# 探测结果缓存：model_id -> {"fingerprint": (url, model, api_key), "data": {...}}
+# 指纹（服务地址/模型ID/Key）变化时自动失效重探
+_probe_cache: dict = {}
+
+
+async def _probe_model_cached(model_id: str) -> dict | None:
+    """探测模型服务端参数（带指纹缓存）；配置不存在或探测失败返回 None。
+
+    供 probe API 与测试启动共用：启动测试时调用可命中缓存（前端选模型
+    时已探测过），几乎零开销。
+    """
+    from .llm_client import probe_model_info
+    m = model_store.get_model(model_id)
+    if m is None:
+        return None
+    api_key = model_store.decode_key(m.get("api_key", ""))
+    fp = (m.get("url", ""), m.get("model", ""), api_key)
+    cached = _probe_cache.get(model_id)
+    if cached and cached["fingerprint"] == fp:
+        return cached["data"]
+    data = await probe_model_info(m["url"], m["model"], api_key)
+    _probe_cache[model_id] = {"fingerprint": fp, "data": data}
+    return data
+
+
+@app.get("/api/models/{model_id}/probe")
+async def api_probe_model(model_id: str):
+    """探测模型服务端关键配置（vLLM 版本 / 最大上下文 / KV cache 容量）。
+
+    结果按模型配置指纹缓存，切换模型不重复探测。
+    """
+    data = await _probe_model_cached(model_id)
+    if data is None:
+        return JSONResponse({"success": False, "error": "配置不存在"}, 404)
+    return {"success": True, **data}
+
+
 # ==================== 文本测试 API ====================
 
 class TextTestPayload(BaseModel):
@@ -99,13 +138,17 @@ async def api_text_start(payload: TextTestPayload):
         return JSONResponse({"success": False, "error": "输入长度档位非法"}, 400)
     if payload.noun_count < 1 or payload.noun_count > 100:
         return JSONResponse({"success": False, "error": "迭代次数需在 1-100 之间"}, 400)
-    if payload.article_length < 50 or payload.article_length > 10000:
-        return JSONResponse({"success": False, "error": "输出长度需在 50-10000 字之间"}, 400)
+    if payload.article_length < 10 or payload.article_length > 10000:
+        return JSONResponse({"success": False, "error": "输出长度需在 10-10000 token 之间"}, 400)
     if payload.concurrency < 1 or payload.concurrency > 1000:
         return JSONResponse({"success": False, "error": "并发度需在 1-1000 之间"}, 400)
+    # 启动时刻快照模型服务端参数（vLLM 版本/最大上下文/KV 容量），随任务
+    # 持久化到 config，报告模式 Profile 区域的数据源。探测失败不阻塞启动
+    # （前端 Profile 显示 "—"）。前端选模型时已探测过，此处通常命中缓存。
+    probe = await _probe_model_cached(payload.model_id)
     return text_engine.start(payload.model_id, payload.noun_count,
                              payload.article_length, payload.concurrency,
-                             payload.input_length)
+                             payload.input_length, probe=probe)
 
 
 @app.get("/api/tests/text/status")

@@ -39,31 +39,38 @@
     <div class="param-card">
       <h3 id="paramPanelTitle">测试场景</h3>
       <div class="param-grid">
-        <div class="param-item">
-          <label>模型配置</label>
-          <select id="textModelSelect"></select>
+        <!-- 第一行：模型配置（占 1/4 宽）+ 服务端参数探测（占余下 3/4） -->
+        <div class="param-row">
+          <div class="param-item">
+            <label>模型配置</label>
+            <select id="textModelSelect"></select>
+          </div>
+          <div class="model-info" id="modelInfo" style="display:none"></div>
         </div>
-        <div class="param-item">
-          <label>输入长度</label>
-          <select id="inputLength">
-            <option value="tiny">极短（~10 token）</option>
-            <option value="short">短（~100 token）</option>
-            <option value="medium">中（~1k token）</option>
-            <option value="long">长（~8k token）</option>
-            <option value="xlong">超长（~16k token）</option>
-          </select>
-        </div>
-        <div class="param-item">
-          <label>迭代次数（每Thread）</label>
-          <input type="number" id="nounCount" value="5" min="1" max="100">
-        </div>
-        <div class="param-item">
-          <label>输出长度（字）</label>
-          <input type="number" id="articleLength" value="500" min="50" max="10000" step="50">
-        </div>
-        <div class="param-item">
-          <label>并发度（并行 Thread 数）</label>
-          <input type="number" id="concurrency" value="2" min="1" max="1000">
+        <!-- 第二行：迭代次数 / 输入长度 / 输出长度 / 并发度 -->
+        <div class="param-row">
+          <div class="param-item">
+            <label>迭代次数（每Thread）</label>
+            <input type="number" id="nounCount" value="5" min="1" max="100">
+          </div>
+          <div class="param-item">
+            <label>输入长度（token）</label>
+            <select id="inputLength">
+              <option value="tiny">极短（~10 token）</option>
+              <option value="short">短（~100 token）</option>
+              <option value="medium">中（~1k token）</option>
+              <option value="long">长（~8k token）</option>
+              <option value="xlong">超长（~16k token）</option>
+            </select>
+          </div>
+          <div class="param-item">
+            <label>输出长度（token）</label>
+            <input type="number" id="articleLength" value="500" min="10" max="10000" step="10">
+          </div>
+          <div class="param-item">
+            <label id="concurrencyLabel">并发度（并行 Thread 数）</label>
+            <input type="number" id="concurrency" value="2" min="1" max="1000">
+          </div>
         </div>
       </div>
       <div class="param-actions">
@@ -100,6 +107,12 @@
         <span id="sumCalls"></span>
         <span id="sumErrors"></span>
         <span id="sumChars"></span>
+      </div>
+      <!-- 测试 Profile（仅报告模式显示）：启动时刻的参数与服务端参数快照，
+           随任务持久化，不随实时探测变化 -->
+      <div class="vllm-bar profile-bar" id="profileBar" style="display:none">
+        <div class="vllm-bar-title">Profile</div>
+        <div class="detail-grid vllm-grid" id="profileBarItems"></div>
       </div>
       <!-- vLLM 服务端指标条（全局，不区分 case；随状态轮询刷新，不低于 15s 一次） -->
       <div class="vllm-bar" id="vllmBar" style="display:none">

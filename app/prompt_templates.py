@@ -4,7 +4,8 @@
 - 每档模板的开头句即含 {noun} 变量，首个 16-token block 内即分叉，公共前缀缓存基本失效；
 - 变量数量随模板长度增加（短 3 个 → 超长 270+ 个），分散在各资料段落中；
 - 每次请求用一个名词填充该档模板的全部变量；
-- 尾部统一为「基于以上材料写约 N 字文章」指令，与 UI 的输出长度参数衔接。
+- 尾部统一为「基于以上材料写约 N 字文章」指令；UI 输出长度参数以 token 为单位，
+  按 ~1.7 字/token 折算为字数后填入指令。
 
 中文 token 换算按 ~1.7 字/token 估算，各档目标（含指令）：
   极短 ~10 token（沿用旧版一句话指令）
@@ -113,7 +114,7 @@ _SHORT_PARA = ("【资料 1·领域动态】在{noun}领域，近期最受关注
 # 开头句：变量位于前几个 token，确保首个缓存 block 即分叉
 _HEADER = '以下是关于"{noun}"的专题资料汇编。'
 
-# 尾部指令：与「输出长度（字）」参数衔接，并强调字数遵循
+# 尾部指令：与「输出长度（token）」参数衔接（token×1.7 折算为字数），并强调字数遵循
 _TAIL = ("请基于以上材料，写一篇约{N}字的文章，写作时请严格遵循该字数要求，"
          "直接输出文章正文。")
 
@@ -134,17 +135,22 @@ def _build_body(para_count: int) -> str:
 _BODIES = {key: _build_body(spec["paras"]) for key, spec in LENGTH_SPECS.items()}
 
 
-def build_prompt(input_length: str, noun: str, article_length: int) -> str:
-    """按档位生成完整输入 prompt：名词填充该档模板的全部变量。"""
+def build_prompt(input_length: str, noun: str, output_tokens: int) -> str:
+    """按档位生成完整输入 prompt：名词填充该档模板的全部变量。
+
+    output_tokens 为目标输出 token 数，按 ~1.7 字/token 折算为字数写入指令
+    （模型对「字数」的遵循远好于「token 数」）。
+    """
     if input_length not in LENGTH_SPECS:
         input_length = "tiny"
+    n_chars = max(20, round(output_tokens * 1.7))
     if input_length == "tiny":
-        return _TINY.format(noun=noun, N=article_length)
+        return _TINY.format(noun=noun, N=n_chars)
     if input_length == "short":
         return (_HEADER + "\n\n" + _SHORT_PARA + "\n\n" +
-                _TAIL.format(N=article_length)).replace("{noun}", noun)
+                _TAIL.format(N=n_chars)).replace("{noun}", noun)
     return (_HEADER + "\n\n" + _BODIES[input_length] + "\n\n" +
-            _TAIL.format(N=article_length)).replace("{noun}", noun)
+            _TAIL.format(N=n_chars)).replace("{noun}", noun)
 
 
 def truncate_for_store(text: str, head: int = 300, tail: int = 200) -> str:

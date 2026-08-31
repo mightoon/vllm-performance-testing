@@ -280,6 +280,72 @@ async function loadModelSelect() {
   if (prev && (models || []).some((m) => m.id === prev)) sel.value = prev;
 }
 
+/* ============ 模型服务端参数探测 ============ */
+/* 输入长度档位 → 名义输入 token 数（用于估算理论并发） */
+const INPUT_TOKENS = { tiny: 10, short: 100, medium: 1000, long: 8000, xlong: 16000 };
+let modelProbe = null;   // 当前选中模型的探测结果 {version, max_model_len, kv_cache_tokens}
+let probeSeq = 0;        // 序号：切换模型时丢弃过期响应
+
+/* token 数缩写：≥1M(1024²) 显示 x百万，≥1K(1024) 显示 xK；
+   恰为整数不带小数位，否则保留一位（8K / 128K / 256K / 3.3百万） */
+function fmtTokens(n) {
+  if (n >= 1048576) {
+    const v = n / 1048576;
+    return (Number.isInteger(v) ? v : v.toFixed(1)) + "百万";
+  }
+  if (n >= 1024) {
+    const v = n / 1024;
+    return (Number.isInteger(v) ? v : v.toFixed(1)) + "K";
+  }
+  return String(n);
+}
+
+/* 并发度 label：有 KV 容量数据时显示预估最大并发数（KV容量 ÷ 每请求token） */
+function updateConcurrencyHint() {
+  const el = $("concurrencyLabel");
+  if (!el) return;
+  let hint = "并行 Thread 数";
+  if (modelProbe && modelProbe.kv_cache_tokens) {
+    const inTok = INPUT_TOKENS[$("inputLength").value] || 10;
+    const outTok = parseInt($("articleLength").value) || 500;
+    const est = Math.floor(modelProbe.kv_cache_tokens / (inTok + outTok));
+    hint = est >= 1 ? `预估最大 ~${est.toLocaleString()}` : "预估最大 <1";
+  }
+  el.textContent = `并发度（${hint}）`;
+}
+
+/* 选中模型后探测服务端参数，显示在模型行空白处 */
+async function probeSelectedModel() {
+  const modelId = $("textModelSelect").value;
+  const info = $("modelInfo");
+  modelProbe = null;
+  updateConcurrencyHint();
+  if (!modelId) { info.style.display = "none"; return; }
+  const seq = ++probeSeq;
+  info.style.display = "flex";
+  info.innerHTML = '<span>服务端参数探测中…</span>';
+  const r = await fetchJSON(`/api/models/${modelId}/probe`);
+  if (seq !== probeSeq) return;   // 已切换到其他模型，丢弃过期响应
+  if (r && r.success) {
+    modelProbe = r;
+    const items = [
+      `vLLM 版本: <b>${r.version ? escapeHtml(r.version) : "—"}</b>`,
+      `最大上下文: <b>${r.max_model_len ? fmtTokens(r.max_model_len) + " token" : "—"}</b>`,
+      `KV cache 容量: <b>${r.kv_cache_tokens ? fmtTokens(r.kv_cache_tokens) + " token" : "—"}</b>`,
+    ];
+    info.innerHTML = items.map((s) => `<span>${s}</span>`)
+      .join('<span class="info-sep">│</span>');
+  } else {
+    const reason = r && r.error === "配置不存在" ? "模型配置已删除" : "非 vLLM 服务或探测失败";
+    info.innerHTML = `<span>服务端参数不可用（${reason}）</span>`;
+  }
+  updateConcurrencyHint();
+}
+
+$("textModelSelect").addEventListener("change", probeSelectedModel);
+$("inputLength").addEventListener("change", updateConcurrencyHint);
+$("articleLength").addEventListener("input", updateConcurrencyHint);
+
 /* ============ 历史测试侧栏与模式管理 ============
    两种模式：
    - run    运行测试模式（原有实现：轮询实时状态）
@@ -329,7 +395,7 @@ function historyItemHtml(t, selected, isDraft) {
     // 任务名已含时间戳，副标题只展示 profile 概要
     sub = [p.concurrency != null && `${p.concurrency}并发`,
            p.noun_count != null && `${p.noun_count}名词`,
-           p.article_length != null && `${p.article_length}字`]
+           p.article_length != null && `${p.article_length} token`]
       .filter(Boolean).join(" · ");
   }
   return `<div class="history-item ${t.name === selected ? "active" : ""}" data-name="${escapeHtml(t.name)}">` +
@@ -507,6 +573,44 @@ function renderMonitorCharts(metrics, summary) {
     const unit = seriesList[0].unit === "%" ? "%" :
       (g === "latency" ? "ms" : seriesList[0].unit);
 
+    // phase 组双 Y 轴：Prefill 耗时远小于 Decode，共用一根轴时 Prefill 曲线
+    // 会贴着 x 轴看不出走势 → Prefill 走左轴、Decode 走右轴，各自独立刻度。
+    // 轴与曲线颜色绑定（蓝=Prefill，绿=Decode），p50 浅色 / p95 深色
+    const isPrefill = (s) => /^prefill/i.test(s.legend);
+    const dualAxis = g === "phase" &&
+      seriesList.some(isPrefill) && seriesList.some((s) => !isPrefill(s));
+    const phaseColor = (s) => {
+      const deep = /p95/i.test(s.legend);
+      return isPrefill(s) ? (deep ? "#2563eb" : "#93c5fd")
+                          : (deep ? "#16a34a" : "#86efac");
+    };
+
+    // 单轴公共配置（非双轴组沿用）
+    const axisCommon = {
+      type: "value",
+      nameGap: 10,
+      scale: g !== "cache",
+      max: g === "cache" ? 100 : undefined,
+      axisLabel: {
+        formatter: (v) => v >= 10000 ? (v / 1000) + "k" : v,
+      },
+    };
+    let yAxis;
+    if (dualAxis) {
+      yAxis = [
+        { ...axisCommon, name: `Prefill (${unit})`, position: "left",
+          nameTextStyle: { color: "#2563eb", fontSize: 11 },
+          axisLabel: { ...axisCommon.axisLabel, color: "#2563eb" } },
+        { ...axisCommon, name: `Decode (${unit})`, position: "right",
+          nameTextStyle: { color: "#16a34a", fontSize: 11 },
+          axisLabel: { ...axisCommon.axisLabel, color: "#16a34a" },
+          splitLine: { show: false } },   // 只保留左轴网格线，避免两套横线交叉
+      ];
+    } else {
+      yAxis = { ...axisCommon, name: unit,
+        nameTextStyle: { color: "#94a3b8", fontSize: 11 } };
+    }
+
     pending.push({
       el: chartEl,
       option: {
@@ -517,23 +621,14 @@ function renderMonitorCharts(metrics, summary) {
           valueFormatter: (v) => v == null ? "—" : `${(+v).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`,
         },
         legend: seriesList.length > 1 ? { bottom: 0, icon: "rect", itemWidth: 14, itemHeight: 4 } : undefined,
-        // 底部留白统一 56px：有图例时时间轴上移避开图例，无图例时同高对齐
-        grid: { left: 56, right: 24, top: 32, bottom: 56 },
+        // 底部留白统一 56px：有图例时时间轴上移避开图例，无图例时同高对齐；
+        // 双轴时右侧需给右轴刻度留位
+        grid: { left: 56, right: dualAxis ? 56 : 24, top: 32, bottom: 56 },
         xAxis: {
           type: "time",
           axisLabel: { hideOverlap: true, formatter: "{HH}:{mm}:{ss}" },
         },
-        yAxis: {
-          type: "value",
-          name: unit,
-          nameGap: 10,
-          nameTextStyle: { color: "#94a3b8", fontSize: 11 },
-          scale: g !== "cache",
-          max: g === "cache" ? 100 : undefined,
-          axisLabel: {
-            formatter: (v) => v >= 10000 ? (v / 1000) + "k" : v,
-          },
-        },
+        yAxis,
         series: seriesList.map((s) => ({
           name: s.legend,
           type: "line",
@@ -541,6 +636,7 @@ function renderMonitorCharts(metrics, summary) {
           data: transform(s),
           lineStyle: { width: 1.6 },
           emphasis: { focus: "series" },
+          ...(dualAxis ? { yAxisIndex: isPrefill(s) ? 0 : 1, color: phaseColor(s) } : {}),
         })),
       },
     });
@@ -621,6 +717,29 @@ function renderReport(config, result) {
   $("nounCount").value = p.noun_count ?? "";
   $("articleLength").value = p.article_length ?? "";
   $("concurrency").value = p.concurrency ?? "";
+  // 历史模型同样触发服务端参数探测（探测条反映该模型当前的服务端状态；
+  // 放在参数填充之后，确保并发度预估使用历史输入/输出长度）
+  probeSelectedModel();
+
+  // Profile 区域：启动时刻的参数与服务端参数快照（config 持久化，不随
+  // 实时探测变化；旧任务无 model_probe 字段时对应项显示 "—"）
+  const pr = config.model_probe || {};
+  const lenLabels = { tiny: "极短（~10 token）", short: "短（~100 token）",
+    medium: "中（~1k token）", long: "长（~8k token）", xlong: "超长（~16k token）" };
+  const profileRows = [
+    ["模型", escapeHtml((config.model && config.model.name) || p.model_name || p.model_id || "—")],
+    ["vLLM 版本", pr.version ? escapeHtml(pr.version) : "—"],
+    ["最大上下文", pr.max_model_len ? fmtTokens(pr.max_model_len) + " token" : "—"],
+    ["KV cache 容量", pr.kv_cache_tokens ? fmtTokens(pr.kv_cache_tokens) + " token" : "—"],
+    ["迭代次数", p.noun_count ?? "—"],
+    ["输入长度", lenLabels[p.input_length] || p.input_length || "—"],
+    ["输出长度", p.article_length != null ? `${p.article_length} token` : "—"],
+    ["并发度", p.concurrency ?? "—"],
+  ];
+  $("profileBarItems").innerHTML = profileRows.map(([k, v]) =>
+    `<div class="detail-item"><span class="detail-k">${k}</span>` +
+    `<span class="detail-v">${v}</span></div>`).join("");
+  $("profileBar").style.display = "block";
 
   // 指标区：汇总 + vLLM 指标条
   const sum = result.summary || {};
@@ -696,11 +815,13 @@ $("btnNewTextTest").addEventListener("click", () => {
   $("nounCount").value = "";
   $("articleLength").value = "";
   $("concurrency").value = "";
+  probeSelectedModel();   // 模型已清空：隐藏探测条并复位并发度 label
   // 运行模式空状态：清空上次测试的 thread 进度行（注意 runEmpty 是 progressList 子元素，不能 innerHTML=""）
   $("progressList").style.display = "";
   $("progressList").querySelectorAll(".case-row").forEach((r) => r.remove());
   $("runSummary").style.display = "none";
   $("vllmBar").style.display = "none";
+  $("profileBar").style.display = "none";
   $("runEmpty").style.display = "block";
   $("btnGenReport").style.display = "none";   // 草稿模式隐藏"生成报告"入口
   $("btnBackStatus").style.display = "none";  // 草稿模式隐藏"返回状态"入口
@@ -739,6 +860,7 @@ $("btnRunText").addEventListener("click", async () => {
   $("progressList").querySelectorAll(".case-row").forEach((row) => row.remove());
   $("runSummary").style.display = "none";
   $("vllmBar").style.display = "none";
+  $("profileBar").style.display = "none";
   $("runEmpty").style.display = "block";
   setRunningUI(true);
   pollStatus(); // 立即刷新一次
@@ -815,6 +937,7 @@ async function pollStatus() {
     $("btnGenReport").style.display = "none";
     $("runEmpty").style.display = "block";
     $("vllmBar").style.display = "none";
+    $("profileBar").style.display = "none";
     return;
   }
   if (s.task_name) textCurrentTask = s.task_name;
@@ -823,6 +946,7 @@ async function pollStatus() {
 
 function renderStatus(s) {
   setRunningUI(s.status === "running");
+  $("profileBar").style.display = "none";   // Profile 仅报告模式显示
   // 测试到达终态：标题旁显示"生成报告"入口，一键转报告页
   $("btnGenReport").style.display = (s.status !== "running" && textCurrentTask) ? "" : "none";
 
@@ -1086,7 +1210,7 @@ function renderVllmBar(m, mode = "live") {
   const bar = $("vllmBar");
   const el = $("vllmBarItems");
   bar.style.display = "block";
-  $("vllmBarTitle").textContent = mode === "live" ? "vLLM 指标（实时）" : "vLLM 指标";
+  $("vllmBarTitle").textContent = mode === "live" ? "vLLM 指标（快照）" : "vLLM 指标";
   if (!m) {
     el.innerHTML = '<div class="detail-item"><span class="detail-v">' +
       (mode === "live" ? "指标采集中…" : "暂无指标数据") + '</span></div>';
@@ -1108,7 +1232,7 @@ function renderVllmBar(m, mode = "live") {
     ["平均生成吞吐", m.gen_throughput_toks_avg == null ? "—" : `${num(m.gen_throughput_toks_avg)} tok/s`],
     ["平均 KV 缓存占用", pct(m.gpu_cache_usage_avg)],
     ["平均前缀缓存命中", pct(m.prefix_cache_hit_rate_avg)],
-    ["平均首字延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
+    ["平均首 token 延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
     ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
     ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
     ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
@@ -1121,7 +1245,7 @@ function renderVllmBar(m, mode = "live") {
     ["生成吞吐", m.gen_throughput_toks == null ? "—" : `${num(m.gen_throughput_toks)} tok/s`],
     ["KV 缓存占用", pct(m.gpu_cache_usage)],
     ["前缀缓存命中", pct(m.prefix_cache_hit_rate)],
-    ["平均首字延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
+    ["平均首 token 延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
     ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
     ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
     ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
@@ -1224,10 +1348,28 @@ $("caseQaList").addEventListener("scroll", () => {
   }
 });
 
+/* Q 文本中的截断存储标记（……[中间 N 字已省略，仅存储首尾部分]……）
+   红色加粗显示，避免被误读为 prompt 原文 */
+function highlightOmitted(text) {
+  return escapeHtml(text).replace(
+    /……\[中间 \d+ 字已省略，仅存储首尾部分\]……/g,
+    (m) => `<span class="qa-omitted">${m}</span>`);
+}
+
 function qaItemHtml(qa, idx, c) {
   const meta = [escapeHtml(qa.phase)];
   if (qa.loop) meta.push(`第 ${qa.loop}/${c.total_loops} 迭代`);
   if (qa.noun) meta.push(`「${escapeHtml(qa.noun)}」`);
+  // 真实输入规模：question 为截断存储（仅首尾），展示完整 prompt 字数。
+  // 新任务读 prompt_chars；旧任务回退解析截断标记（首300+尾200+省略N字）；
+  // 无标记则 question 即全文
+  let inChars = qa.prompt_chars || 0;
+  if (!inChars) {
+    const m = (qa.question || "").match(/中间 (\d+) 字已省略/);
+    if (m) inChars = 500 + parseInt(m[1], 10);
+  }
+  if (!inChars) inChars = (qa.question || "").length;
+  if (inChars) meta.push(`输入 ${inChars.toLocaleString()} 字（≈${fmtTokens(Math.round(inChars / 1.7))} token）`);
   if (qa.duration) meta.push(`${qa.duration}s`);
   if (qa.ttft != null) meta.push(`TTFT ${qa.ttft}s`);
 
@@ -1246,7 +1388,7 @@ function qaItemHtml(qa, idx, c) {
   }
   return `<div class="qa-item ${qa.status}" data-idx="${idx}">
     <div class="qa-meta">#${idx + 1} · ${meta.join(" · ")}</div>
-    <div class="qa-question">Q: ${escapeHtml(qa.question)}</div>
+    <div class="qa-question">Q: ${highlightOmitted(qa.question)}</div>
     ${answerHtml}
   </div>`;
 }
@@ -1300,5 +1442,6 @@ function fmtElapsed(sec) {
     renderStatus(s);
     renderHistoryList();
   }
+  if ($("textModelSelect").value) probeSelectedModel();
   restartPolling();
 })();
