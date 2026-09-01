@@ -380,10 +380,9 @@ body {
   margin-bottom: 14px;
 }
 .vllm-bar-title {
-  font-size: 13px;
+  font-size: 16px;
   color: var(--text-sub);
-  font-weight: 600;
-  text-transform: uppercase;
+  font-weight: 700;
   letter-spacing: 0.4px;
   margin-bottom: 8px;
 }
@@ -582,8 +581,29 @@ body {
   line-height: 1.6;
 }
 
+/* ============ 报告模式 AI 分析 ============ */
+.analysis-area { margin-top: 20px; }
+.analysis-body {
+  margin-top: 10px;
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--text);
+}
+.analysis-md p { margin: 0 0 8px; }
+.analysis-md p:last-child { margin-bottom: 0; }
+.analysis-md ul, .analysis-md ol { margin: 4px 0 10px; padding-left: 22px; }
+.analysis-md li { margin: 2px 0; }
+.analysis-md strong { color: var(--accent); }
+.analysis-empty {
+  text-align: center;
+  color: var(--text-sub);
+  padding: 26px 0;
+  font-size: 13px;
+}
+
 /* ============ 报告模式监控图表 ============ */
 .monitor-area { margin-top: 20px; }
+.monitor-area .run-area-header h3 { font-size: 16px; font-weight: 700; }
 .monitor-source { font-size: 12px; font-weight: 400; color: var(--text-sub); }
 .grafana-link {
   font-size: 13px;

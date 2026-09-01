@@ -5,7 +5,6 @@
 并发度 = 同时运行的 case 数。每个 case 的进度通过轮询接口暴露给前端进度条。
 """
 import asyncio
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -13,6 +12,7 @@ from typing import Optional
 from . import model_store
 from .llm_client import chat_completion_stream, fetch_vllm_metrics
 from .noun_library import pick_nouns_pool
+from . import analysis
 from . import prompt_templates
 from . import prom_snapshot
 from . import workspace
@@ -169,8 +169,6 @@ class TextTestEngine:
         self._counter_baseline: dict = {}  # 本轮测试开始时的 counter 基线
         self._metrics_stats: dict = {}    # 整轮指标统计累加器（峰值/均值，供报告模式）
         self._last_gt_sample: Optional[tuple] = None  # (采样时刻, generation_tokens_total)，吞吐差分用
-        self._ttft_buckets = None         # 最近一次基线差分后的 TTFT 直方图桶
-        self._ttft_bucket_base = None     # 桶累计计数基线 {le: count}
         self._noun_pool: list = []        # 全局名词池（各 thread 取不重叠分片）
         self.task_name: str = ""          # 本轮测试任务名（workspace 目录名）
 
@@ -223,8 +221,6 @@ class TextTestEngine:
         self._counter_baseline = {}
         self._metrics_stats = {}
         self._last_gt_sample = None
-        self._ttft_buckets = None
-        self._ttft_bucket_base = None
         self._metrics_task = loop.create_task(self._poll_vllm_metrics())
         # 持久化：启动即写 config（profile + 模型快照），结束后由 _wait_all 写 result
         workspace.save_config(self.task_name, {
@@ -338,10 +334,12 @@ class TextTestEngine:
                 workspace.save_result(self.task_name, result)
             except OSError:
                 pass  # 磁盘写入失败不影响测试本身
-        # 监控快照：后台拉取 Prometheus 指标存档（不阻塞结束流程；
-        # 未配置 Prometheus 或拉取失败均静默，不影响测试结果）
+        # 监控快照 + AI 分析：均后台执行，不阻塞结束流程。
+        # 分析等快照落盘后再跑（输入含 Prometheus 统计）；
+        # 未配置 Prometheus / 模型调用失败均静默，不影响测试结果
         if self.task_name and self.started_at and self.finished_at:
-            asyncio.create_task(self._snapshot_metrics())
+            snap_task = asyncio.create_task(self._snapshot_metrics())
+            asyncio.create_task(analysis.run_and_save(self.task_name, snap_task))
 
     async def _snapshot_metrics(self):
         """测试结束后按起止时间拉取 Prometheus 指标快照。"""
@@ -385,18 +383,6 @@ class TextTestEngine:
         累计整轮统计、更新实时快照。"""
         m = r["metrics"]
         now = time.time()
-        # TTFT 直方图桶（累计 counter）：同样扣除本轮基线，
-        # 供报告模式做区间删失 MLE 拟合分位数。首次采样或
-        # vLLM 重启 counter 归零时（重新）校准基线。
-        bks = r.get("ttft_buckets") or []
-        if bks:
-            base = self._ttft_bucket_base
-            if base is None or any(
-                    c < base.get(le, 0) for le, c in bks):
-                base = {le: c for le, c in bks}
-                self._ttft_bucket_base = base
-            self._ttft_buckets = [
-                (le, c - base.get(le, 0)) for le, c in bks]
         # 新版 vLLM 移除了吞吐 gauge：
         # 用 generation_tokens_total 两次采样的差分计算 tok/s
         if m.get("gen_throughput_toks") is None:
@@ -510,13 +496,8 @@ class TextTestEngine:
                 return round(num / den, digits)
             return avg(fallback_key, digits)
 
-        # TTFT 分位数：区间删失 MLE 拟合（修正 Prometheus 直方图宽桶
-        # 线性插值的系统性误差），锚定本轮精确均值（最后一次快照的
-        # sum/count 差分）
-        mean_s = (m["ttft_sum"] / m["ttft_cnt"]
-                  if m.get("ttft_sum") is not None and m.get("ttft_cnt")
-                  else None)
-        p50, p95 = self._fit_ttft_quantiles(mean_s)
+        # TTFT 分位数已不在报告中输出（监控区改为直查 Prometheus
+        # 直方图分位数曲线，见 doc/metrics.md 方案二状态说明）
         return {
             "samples": st["samples"],
             "running_requests_max": st.get("running_requests_max"),
@@ -540,8 +521,6 @@ class TextTestEngine:
             # 排队/prefill/decode 全程；旧版 vLLM 无此指标 → 前端 —）
             "e2e_avg_s": final_ratio(
                 "e2e_sum", "e2e_cnt", 3, "e2e_avg_s"),
-            "ttft_p50_fit_s": p50,
-            "ttft_p95_fit_s": p95,
             # tokens 为本轮累计 counter（已扣除基线），取最后一次快照
             "prompt_tokens_total": m.get("prompt_tokens_total"),
             "generation_tokens_total": m.get("generation_tokens_total"),
@@ -550,81 +529,6 @@ class TextTestEngine:
             # 见 doc/metrics.md 案例四）
             "preemptions_total": m.get("preemptions_total"),
         }
-
-    def _fit_ttft_quantiles(self, mean_s: Optional[float]):
-        """区间删失 MLE 拟合本轮 TTFT 分布（对数正态），返回 (p50, p95)。
-
-        直方图桶计数只知"样本落在哪个桶"：以对数正态为模型，桶质量
-        构造似然；并用本轮精确均值作锚定约束（对数正态均值 =
-        exp(μ + σ²/2)，故 μ = ln(mean) - σ²/2），把问题化为一维
-        黄金分割搜索 σ，无需 scipy。桶数据缺失/无样本/拟合失败
-        （似然无有限值）时返回 (None, None)。
-        """
-        bks = self._ttft_buckets
-        if not bks or not mean_s or mean_s <= 0:
-            return None, None
-        # 累计桶计数展开为区间 (a, b] 与样本数；末桶 (le_max, +Inf)
-        counts = []
-        prev_le, prev_cum = 0.0, 0.0
-        total = 0
-        for le, cum in bks:
-            n = max(0, int(round(cum - prev_cum)))
-            counts.append((prev_le, le, n))
-            total += n
-            prev_le, prev_cum = le, cum
-        if total <= 0:
-            return None, None
-
-        sqrt2 = math.sqrt(2.0)
-        ln_mean = math.log(mean_s)
-
-        def cdf(x: float, mu: float, sigma: float) -> float:
-            return 0.5 * (1.0 + math.erf((x - mu) / (sigma * sqrt2)))
-
-        def nll(ln_sigma: float) -> float:
-            sigma = math.exp(ln_sigma)
-            mu = ln_mean - sigma * sigma / 2.0
-            v = 0.0
-            for a, b, n in counts:
-                if n <= 0:
-                    continue
-                if math.isinf(b):
-                    p = (1.0 - cdf(math.log(a), mu, sigma)) if a > 0 else 1.0
-                else:
-                    hi = cdf(math.log(b), mu, sigma)
-                    lo = cdf(math.log(a), mu, sigma) if a > 0 else 0.0
-                    p = hi - lo
-                if p <= 0.0:
-                    return float("inf")
-                v -= n * math.log(p)
-            return v
-
-        # 黄金分割搜索 ln(σ)，σ ∈ [1e-4, 5]
-        gr = (math.sqrt(5.0) - 1.0) / 2.0
-        a, b = math.log(1e-4), math.log(5.0)
-        c, d = b - gr * (b - a), a + gr * (b - a)
-        fc, fd = nll(c), nll(d)
-        for _ in range(100):
-            if b - a < 1e-7:
-                break
-            if fc < fd:
-                b, d, fd = d, c, fc
-                c = b - gr * (b - a)
-                fc = nll(c)
-            else:
-                a, c, fc = c, d, fd
-                d = a + gr * (b - a)
-                fd = nll(d)
-        ln_sigma = (a + b) / 2.0
-        if not math.isfinite(nll(ln_sigma)):
-            return None, None
-        sigma = math.exp(ln_sigma)
-        mu = ln_mean - sigma * sigma / 2.0
-        p50 = math.exp(mu)
-        p95 = math.exp(mu + 1.6448536269514722 * sigma)
-        if not (0 < p50 < 1e6 and 0 < p95 < 1e6):
-            return None, None
-        return round(p50, 4), round(p95, 4)
 
     async def _wait_rampup(self, case: CaseState, delay: float) -> bool:
         """错峰启动等待。返回 False 表示测试已被停止。

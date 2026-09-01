@@ -1,7 +1,6 @@
 """LLM API 客户端（OpenAI 兼容接口）。"""
 import asyncio
 import json
-import math
 import re
 
 import httpx
@@ -374,39 +373,6 @@ def extract_vllm_metrics(raw: dict) -> dict:
     }
 
 
-# TTFT 直方图桶行：vllm:time_to_first_token_seconds_bucket{le="0.01"} 5
-_TTFT_BUCKET_RE = re.compile(
-    r'^(?:vllm:)?time_to_first_token_seconds_bucket'
-    r'\{[^}]*\ble="([^"]+)"[^}]*\}\s+(\S+)$')
-
-
-def extract_ttft_buckets(text: str) -> list:
-    """解析 TTFT 直方图桶累计计数，返回按 le 升序的 [(le, count), ...]。
-
-    含 +Inf 桶（le 为 float('inf')）；无直方图数据时返回 []。
-    桶计数为服务启动以来的累计 counter，由引擎扣除本轮基线后，
-    用区间删失 MLE 拟合分位数（修正 histogram_quantile 在宽桶
-    内线性插值的系统性误差）。
-    """
-    buckets: dict = {}
-    for line in text.splitlines():
-        m = _TTFT_BUCKET_RE.match(line.strip())
-        if not m:
-            continue
-        le_raw, val = m.groups()
-        try:
-            le = float(le_raw)
-            count = float(val)
-        except ValueError:
-            continue
-        if math.isnan(count) or math.isinf(count):
-            continue
-        # 同一 le 保留较大值（多实例/重复行时取累计口径最大者）
-        if le not in buckets or count > buckets[le]:
-            buckets[le] = count
-    return sorted(buckets.items())
-
-
 # ---------------------------------------------------------------------------
 # 模型服务端能力探测（vLLM 版本 / 最大上下文长度 / KV cache 容量）
 # ---------------------------------------------------------------------------
@@ -545,8 +511,7 @@ async def fetch_vllm_metrics(base_url: str, api_key: str = "",
     """抓取 vLLM /metrics 并返回提取后的主要指标。
 
     Returns:
-        {"success": True, "metrics": {...}, "ttft_buckets": [(le, count), ...]}
-        或 {"success": False, "error": str}
+        {"success": True, "metrics": {...}} 或 {"success": False, "error": str}
     """
     url = _metrics_url(base_url)
     headers = {}
@@ -564,7 +529,6 @@ async def fetch_vllm_metrics(base_url: str, api_key: str = "",
             return {"success": False,
                     "error": f"HTTP {resp.status_code}（{url}）"}
         return {"success": True,
-                "metrics": extract_vllm_metrics(_parse_prometheus(resp.text)),
-                "ttft_buckets": extract_ttft_buckets(resp.text)}
+                "metrics": extract_vllm_metrics(_parse_prometheus(resp.text))}
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {e}"}

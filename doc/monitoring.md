@@ -127,6 +127,34 @@ PromQL、分组、单位、图例名。**加指标 = 向列表追加条目**（�
 - Prometheus 返回的 value 为**字符串**，需转 float
 - 直方图在无数据窗口返回 **NaN**，转为 null 存储（ECharts 断线渲染），
   否则 FastAPI JSONResponse 会因 "Out of range float values" 报 500
+- 事件型直方图（e2e/ttft）在"请求波"间隙（同批请求完成与下批启动之间
+  的静默期，约 15~30s）会出现 NaN 空洞，断线干扰趋势阅读：前端对
+  **两侧均有有效点且空洞 ≤ 45s** 的 null 段做桥接（删点让折线连过），
+  更长的间隙（测试开头首波完成前、结束后）保留断线，如实表达"无观测"
+  （`app.js` 的 `bridgeShortGaps`，实测两次测试中段缺口全部消除，
+  仅剩首部空白与结尾 EOF 缺口）
+
+## AI 分析（Analysis 区块）
+
+测试结束后，把该次测试的 **profile + 指标摘要**交给**被测模型本身**，
+生成 500 字以内的分析结论（问题/潜在问题指标 + 指标间交叉验证），
+持久化到 `workspace/<任务名>/analysis.json`，报告模式 Charts 上方展示。
+
+- **模块**：`app/analysis.py`（摘要收集 `profile`/`test`/`vllm_metrics`/
+  `prometheus_stats` 四组 → `build_prompt` → `chat_completion` 非流式调用
+  → `_save` 持久化）
+- **触发时机**：`_wait_all` 写完 result 后创建后台任务，**先等监控快照
+  落盘再执行**（分析输入含 Prometheus 统计）；调用发生在测试结束之后，
+  不影响测试过程数据。失败静默（存 `status=error`），不影响测试结果
+- **API**：`GET /api/tests/text/history/{task}/analysis` — 读持久化结果，
+  附带 `pending` 标记（后台正在生成中）；无手动生成入口，分析仅由
+  测试结束流程自动触发
+- **前端**：`analysisArea` 区块（`loadAnalysis`/`renderAnalysis`），
+  markdown 渲染 + 生成时间标注；生成中显示"分析正在生成中。。。"并
+  每 15s 轮询直至完成；旧任务无记录时显示占位
+- **输入摘要**（送入 LLM 的 JSON）同时存入 analysis.json 的 `summary`
+  字段，便于复现与调试
+- 被测模型配置已删除时无法分析（返回明确错误提示）
 
 统计卡片（后端预计算入 `stats`）：
 

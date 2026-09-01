@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from . import _paths
+from . import analysis
 from . import model_store
 from . import prom_snapshot
 from . import workspace
@@ -347,6 +348,21 @@ async def api_text_history_metrics(task_name: str):
                     pass  # 实时查询失败：走空数据兜底
     # 3. 无监控数据
     return {"success": True, "source": None, "metrics": None}
+
+
+# ==================== 测试结果 AI 分析 ====================
+
+@app.get("/api/tests/text/history/{task_name}/analysis")
+def api_text_history_analysis(task_name: str):
+    """读取持久化的 AI 分析结论（无则 analysis 为 null）。
+
+    pending: 后台正在生成中（报告页显示"生成中"并轮询）。
+    """
+    return {
+        "success": True,
+        "analysis": analysis.load_analysis(task_name),
+        "pending": analysis.is_pending(task_name),
+    }
 
 
 # ==================== 静态页面 ====================

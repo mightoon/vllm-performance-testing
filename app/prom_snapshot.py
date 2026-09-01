@@ -15,11 +15,164 @@ import httpx
 
 from . import workspace
 
-# 指标清单：group 相同的序列前端渲染为同一张图。
+# 指标清单：group 相同的序列前端渲染为同一张图（每行两图，共四行：
+# e2e/latency → itl/phase → throughput/gpu → concurrency/preemption）。
 # PromQL 兼容新旧 vLLM 命名（旧版无前缀，新版 vllm: 前缀；
 # kv cache 指标新版由 gpu_cache_usage_perc 改名 kv_cache_usage_perc），
 # 用 PromQL or 回退：前者无数据时自动使用后者。
+# hidden=True 的序列只参与统计卡片计算，不渲染进图表。
 METRICS = [
+    # ---- 第一行左图：端到端请求延迟分位数（含 tokenize/排队/生成全程）----
+    {
+        "key": "e2e_p50",
+        "group": "e2e",
+        "legend": "P50",
+        "unit": "s",
+        "promql": "histogram_quantile(0.5, sum by (le) (rate(e2e_request_latency_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[30s])))",
+    },
+    {
+        "key": "e2e_p95",
+        "group": "e2e",
+        "legend": "P95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(e2e_request_latency_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[30s])))",
+    },
+    {
+        "key": "e2e_p99",
+        "group": "e2e",
+        "legend": "P99",
+        "unit": "s",
+        "promql": "histogram_quantile(0.99, sum by (le) (rate(e2e_request_latency_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[30s])))",
+    },
+    # ---- 第一行右图：首 token 延迟（TTFT）分位数 ----
+    {
+        "key": "ttft_p50",
+        "group": "latency",
+        "legend": "P50",
+        "unit": "s",
+        "promql": "histogram_quantile(0.5, sum by (le) (rate(time_to_first_token_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[30s])))",
+    },
+    {
+        "key": "ttft_p95",
+        "group": "latency",
+        "legend": "P95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(time_to_first_token_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[30s])))",
+    },
+    {
+        "key": "ttft_p99",
+        "group": "latency",
+        "legend": "P99",
+        "unit": "s",
+        "promql": "histogram_quantile(0.99, sum by (le) (rate(time_to_first_token_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[30s])))",
+    },
+    # ---- 第二行左图：token 间隔延迟（ITL）分位数 + TPOT 均值 ----
+    # ITL 相邻 token 间隔的分布：P99 暴露流式抖动（卡顿尖刺）；
+    # TPOT 为每输出 token 平均时间（sum/count 速率比，请求等权均值）
+    {
+        "key": "itl_p50",
+        "group": "itl",
+        "legend": "ITL P50",
+        "unit": "s",
+        "promql": "histogram_quantile(0.5, sum by (le) (rate(inter_token_latency_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[30s])))",
+    },
+    {
+        "key": "itl_p95",
+        "group": "itl",
+        "legend": "ITL P95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(inter_token_latency_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[30s])))",
+    },
+    {
+        "key": "itl_p99",
+        "group": "itl",
+        "legend": "ITL P99",
+        "unit": "s",
+        "promql": "histogram_quantile(0.99, sum by (le) (rate(inter_token_latency_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.99, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[30s])))",
+    },
+    {
+        "key": "tpot_avg",
+        "group": "itl",
+        "legend": "TPOT 均值",
+        "unit": "s",
+        # 新版 vLLM 直方图名为 request_time_per_output_token_seconds，
+        # 旧版为 time_per_output_token_seconds；各覆盖 bare / vllm: 前缀
+        "promql": "(rate(request_time_per_output_token_seconds_sum[30s]) / "
+                  "rate(request_time_per_output_token_seconds_count[30s])) "
+                  "or (rate(vllm:request_time_per_output_token_seconds_sum[30s]) / "
+                  "rate(vllm:request_time_per_output_token_seconds_count[30s])) "
+                  "or (rate(time_per_output_token_seconds_sum[30s]) / "
+                  "rate(time_per_output_token_seconds_count[30s])) "
+                  "or (rate(vllm:time_per_output_token_seconds_sum[30s]) / "
+                  "rate(vllm:time_per_output_token_seconds_count[30s]))",
+    },
+    # ---- 第二行右图：排队 / Prefill / Decode 阶段耗时 P95 ----
+    # （较新 vLLM 才暴露；旧版查询无数据自动跳过）
+    {
+        "key": "queue_p95",
+        "group": "phase",
+        "legend": "Queue P95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_queue_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[30s])))",
+    },
+    {
+        "key": "prefill_p95",
+        "group": "phase",
+        "legend": "Prefill P95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_prefill_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[30s])))",
+    },
+    {
+        "key": "decode_p95",
+        "group": "phase",
+        "legend": "Decode P95",
+        "unit": "s",
+        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_decode_time_seconds_bucket[30s]))) "
+                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[30s])))",
+    },
+    # ---- 第三行左图：生成吞吐（irate 瞬时速率）----
+    {
+        "key": "gen_throughput",
+        "group": "throughput",
+        "legend": "生成吞吐",
+        "unit": "tok/s",
+        "promql": "irate(generation_tokens_total[1m]) or irate(vllm:generation_tokens_total[1m])",
+    },
+    # ---- 第三行右图：KV cache 与 GPU 利用率（均 0-100%，共轴）----
+    {
+        "key": "kv_cache_usage",
+        "group": "gpu",
+        "legend": "KV cache 使用率",
+        "unit": "%",
+        "promql": "gpu_cache_usage_perc or vllm:gpu_cache_usage_perc "
+                  "or vllm:kv_cache_usage_perc or kv_cache_usage_perc",
+    },
+    {
+        "key": "gpu_mem_copy_util",
+        "group": "gpu",
+        "legend": "显存控制器使用率",
+        "unit": "%",
+        "promql": "avg(DCGM_FI_DEV_MEM_COPY_UTIL)",
+    },
+    {
+        "key": "gpu_util",
+        "group": "gpu",
+        "legend": "GPU 计算利用率",
+        "unit": "%",
+        "promql": "avg(DCGM_FI_DEV_GPU_UTIL)",
+    },
+    # ---- 第四行左图：并发与排队 ----
     {
         "key": "num_requests_running",
         "group": "concurrency",
@@ -34,95 +187,24 @@ METRICS = [
         "unit": "req",
         "promql": "num_requests_waiting or vllm:num_requests_waiting",
     },
-    {
-        "key": "kv_cache_usage",
-        "group": "cache",
-        "legend": "KV cache 使用率",
-        "unit": "%",
-        "promql": "gpu_cache_usage_perc or vllm:gpu_cache_usage_perc "
-                  "or vllm:kv_cache_usage_perc or kv_cache_usage_perc",
-    },
-    {
-        "key": "ttft_p50",
-        "group": "latency",
-        "legend": "TTFT p50",
-        "unit": "s",
-        "promql": "histogram_quantile(0.5, sum by (le) (rate(time_to_first_token_seconds_bucket[30s]))) "
-                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[30s])))",
-    },
-    {
-        "key": "ttft_p95",
-        "group": "latency",
-        "legend": "TTFT p95",
-        "unit": "s",
-        "promql": "histogram_quantile(0.95, sum by (le) (rate(time_to_first_token_seconds_bucket[30s]))) "
-                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[30s])))",
-    },
-    {
-        "key": "gen_throughput",
-        "group": "throughput",
-        "legend": "生成吞吐",
-        "unit": "tok/s",
-        "promql": "rate(generation_tokens_total[1m]) or rate(vllm:generation_tokens_total[1m])",
-    },
+    # ---- 第四行右图：请求抢占 ----
     {
         "key": "preemptions_rate",
         "group": "preemption",
         "legend": "请求抢占速率",
         "unit": "req/s",
-        "promql": "rate(num_preemptions_total[1m]) or rate(vllm:num_preemptions_total[1m])",
+        "promql": "irate(num_preemptions_total[1m]) or irate(vllm:num_preemptions_total[1m])",
     },
-    # prefill / decode 阶段耗时（较新 vLLM 才暴露；旧版查询无数据自动跳过）
-    {
-        "key": "prefill_p50",
-        "group": "phase",
-        "legend": "Prefill p50",
-        "unit": "s",
-        "promql": "histogram_quantile(0.5, sum by (le) (rate(request_prefill_time_seconds_bucket[30s]))) "
-                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[30s])))",
-    },
-    {
-        "key": "prefill_p95",
-        "group": "phase",
-        "legend": "Prefill p95",
-        "unit": "s",
-        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_prefill_time_seconds_bucket[30s]))) "
-                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[30s])))",
-    },
-    {
-        "key": "decode_p50",
-        "group": "phase",
-        "legend": "Decode p50",
-        "unit": "s",
-        "promql": "histogram_quantile(0.5, sum by (le) (rate(request_decode_time_seconds_bucket[30s]))) "
-                  "or histogram_quantile(0.5, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[30s])))",
-    },
-    {
-        "key": "decode_p95",
-        "group": "phase",
-        "legend": "Decode p95",
-        "unit": "s",
-        "promql": "histogram_quantile(0.95, sum by (le) (rate(request_decode_time_seconds_bucket[30s]))) "
-                  "or histogram_quantile(0.95, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[30s])))",
-    },
-    # DCGM GPU 显存指标（dcgm-exporter 暴露，非 vLLM）：
-    # - 显存使用率：每卡 FB_USED/(USED+FREE) 后跨卡平均（各卡等权）
-    # - 显存控制器使用率：MEM_COPY_UTIL（即 nvidia-smi 的 Memory-Util%）
-    # 未部署 dcgm-exporter 时查询无数据，自动跳过
+    # ---- 仅统计用（hidden，不进图）：GPU 显存使用率 ----
+    # 卡片"GPU 显存使用率"与报告 Metrics"资源指标"组消费其均值
     {
         "key": "gpu_fb_usage",
         "group": "gpu",
         "legend": "显存使用率",
         "unit": "%",
+        "hidden": True,
         "promql": "avg(DCGM_FI_DEV_FB_USED / "
                   "(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)) * 100",
-    },
-    {
-        "key": "gpu_mem_copy_util",
-        "group": "gpu",
-        "legend": "显存控制器使用率",
-        "unit": "%",
-        "promql": "avg(DCGM_FI_DEV_MEM_COPY_UTIL)",
     },
 ]
 
@@ -175,16 +257,13 @@ def _compute_stats(series: list) -> dict:
         return round(max(vals) * scale, 1) if vals else None
 
     return {
-        "gen_throughput_avg": avg("gen_throughput"),
         "gen_throughput_peak": peak("gen_throughput"),
-        "ttft_p50_avg_ms": avg("ttft_p50", 1000.0),
-        "ttft_p95_peak_ms": peak("ttft_p95", 1000.0),
         # kv_cache_usage 原始值为 0-1 小数，换算为百分比
         "kv_cache_peak_perc": peak("kv_cache_usage", 100.0),
         # 抢占速率峰值：>0 说明测试期间 KV cache 曾耗尽（精确累计
         # 次数见报告 vLLM 指标区的"累计抢占次数"）
         "preemptions_rate_peak": peak("preemptions_rate"),
-        # DCGM GPU 显存（各卡平均，报告"资源指标"组展示；
+        # DCGM GPU 显存（各卡平均，报告"资源指标"组与监控卡片展示；
         # 序列原始值已是 0-100 百分比）
         "gpu_fb_usage_avg": avg("gpu_fb_usage"),
         "gpu_mem_copy_util_avg": avg("gpu_mem_copy_util"),
@@ -215,6 +294,7 @@ async def fetch_snapshot(base_url: str, start: float, end: float) -> dict:
                     "legend": m["legend"],
                     "unit": m["unit"],
                     "promql": m["promql"],
+                    "hidden": bool(m.get("hidden")),
                     # Prometheus 返回的 value 为字符串，转 float（NaN → None）
                     "data": [[t, _to_f(v)] for t, v in values],
                 })

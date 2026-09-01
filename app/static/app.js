@@ -393,9 +393,11 @@ function historyItemHtml(t, selected, isDraft) {
     sub = "待填写参数";
   } else {
     // 任务名已含时间戳，副标题只展示 profile 概要
+    // （输入 token 数由 input_length 档位换算，旧任务无该字段时跳过该项）
+    const inTok = INPUT_TOKENS[p.input_length];
     sub = [p.concurrency != null && `${p.concurrency}并发`,
-           p.noun_count != null && `${p.noun_count}名词`,
-           p.article_length != null && `${p.article_length} token`]
+           inTok != null && `${inTok} 输入token`,
+           p.article_length != null && `${p.article_length} 输出token`]
       .filter(Boolean).join(" · ");
   }
   return `<div class="history-item ${t.name === selected ? "active" : ""}" data-name="${escapeHtml(t.name)}">` +
@@ -433,6 +435,7 @@ function enterRunMode() {
   $("btnGenReport").style.display = "none";   // 运行模式隐藏，终态时由 renderStatus 显示
   $("btnBackStatus").style.display = "none";  // 仅报告模式显示
   hideMonitor();   // 监控图表仅报告模式显示
+  hideAnalysis();  // AI 分析仅报告模式显示
   $("progressList").style.display = "";
   restartPolling();
   renderHistoryList();
@@ -484,6 +487,64 @@ async function loadMonitorCharts(taskName, config, result) {
   renderMonitorCharts(r.metrics, (result || {}).vllm_metrics_summary);
 }
 
+/* ============ AI 分析（报告模式，Charts 上方） ============ */
+
+let analysisPollTimer = null;
+
+function stopAnalysisPoll() {
+  if (analysisPollTimer) { clearTimeout(analysisPollTimer); analysisPollTimer = null; }
+}
+
+function hideAnalysis() {
+  $("analysisArea").style.display = "none";
+  stopAnalysisPoll();
+}
+
+/* 加载持久化 AI 分析：测试结束后后端自动生成（先等监控快照落盘，
+   再调用被测模型，最长约 3 分钟）。尚未生成完时显示"生成中"并
+   每 15s 轮询，生成完自动渲染；旧任务无记录时显示占位 */
+async function loadAnalysis(taskName) {
+  stopAnalysisPoll();
+  $("analysisArea").style.display = "block";
+  $("analysisBody").innerHTML = '<div class="analysis-empty">分析加载中…</div>';
+  $("analysisMeta").textContent = "";
+
+  const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}/analysis`);
+  if (r && r.analysis) {
+    renderAnalysis(r.analysis);
+  } else if (r && r.pending) {
+    $("analysisBody").innerHTML = '<div class="analysis-empty">分析正在生成中。。。</div>';
+    pollAnalysis(taskName);
+  } else {
+    $("analysisBody").innerHTML =
+      '<div class="analysis-empty">暂无分析（旧任务无自动分析记录）</div>';
+  }
+}
+
+/* 生成中轮询：完成则渲染，仍在生成则继续等，中断（如服务重启）则占位 */
+function pollAnalysis(taskName) {
+  analysisPollTimer = setTimeout(async () => {
+    analysisPollTimer = null;
+    const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}/analysis`);
+    if (r && r.analysis) { renderAnalysis(r.analysis); return; }
+    if (r && r.pending) { pollAnalysis(taskName); return; }
+    $("analysisBody").innerHTML =
+      '<div class="analysis-empty">暂无分析（旧任务无自动分析记录）</div>';
+  }, 15000);
+}
+
+function renderAnalysis(a) {
+  if (a.status === "done" && a.content) {
+    $("analysisBody").innerHTML = `<div class="analysis-md">${renderMarkdown(a.content)}</div>`;
+    $("analysisMeta").textContent = a.generated_at
+      ? `（${new Date(a.generated_at * 1000).toLocaleString()} 生成）` : "";
+  } else {
+    $("analysisBody").innerHTML =
+      `<div class="analysis-empty">分析失败：${escapeHtml(a.error || "未知错误")}</div>`;
+    $("analysisMeta").textContent = "";
+  }
+}
+
 /* Grafana 跳转链接（配置了 Grafana URL 时显示，带测试起止时间） */
 async function updateGrafanaLink(config, result) {
   const link = $("grafanaLink");
@@ -506,15 +567,40 @@ async function updateGrafanaLink(config, result) {
 
 /* 渲染统计卡片 + 分组折线图 */
 const MONITOR_GROUP_TITLES = {
-  concurrency: "并发与排队",
-  cache: "KV cache 使用率",
+  e2e: "端到端延迟（e2e_request_latency）",
   latency: "首 token 延迟（TTFT）",
+  itl: "token 间隔延迟（ITL）与 TPOT",
+  phase: "Queue / Prefill / Decode 耗时（P95）",
   throughput: "生成吞吐",
+  gpu: "KV cache 与 GPU 利用率（DCGM，各卡平均）",
+  concurrency: "并发与排队",
   preemption: "请求抢占（KV cache 耗尽时调度器强制腾位）",
-  phase: "Prefill / Decode 阶段耗时",
-  gpu: "GPU 显存（DCGM，各卡平均）",
 };
-const MONITOR_GROUP_ORDER = ["concurrency", "cache", "latency", "phase", "throughput", "preemption", "gpu"];
+const MONITOR_GROUP_ORDER = ["e2e", "latency", "itl", "phase", "throughput", "gpu", "concurrency", "preemption"];
+
+/* 短间隙桥接：e2e/ttft 等事件型直方图指标在"请求波"间隙（同批请求
+   完成与下批启动之间的静默期）会出现 15~30s 的 NaN 空洞，断线会
+   干扰趋势阅读。两侧均有有效点且空洞 ≤ 45s 的 null 段直接删除，
+   让折线连过；更长的间隙（测试开头首波完成前、结束后）保留 null
+   断开，如实表达"该时段确无观测"。密集型序列（吞吐/并发等）无
+   null，此处理为无操作。 */
+const GAP_BRIDGE_MS = 45000;
+
+function bridgeShortGaps(data) {
+  const out = [];
+  let run = [];   // 当前连续 null 段
+  for (const p of data) {
+    if (p[1] == null) { run.push(p); continue; }
+    // 前面有有效点且空洞过长 → 保留 null 段，折线断开；
+    // 否则（空洞短，或位于序列头部无从连接）丢弃 null 段桥接
+    if (run.length && out.length && p[0] - out[out.length - 1][0] > GAP_BRIDGE_MS)
+      out.push(...run);
+    out.push(p);
+    run = [];
+  }
+  out.push(...run);   // 末尾 null 段原样保留（后面无锚点，本就不画线）
+  return out;
+}
 
 function renderMonitorCharts(metrics, summary) {
   const fmt = (v) => v == null ? "—" :
@@ -522,27 +608,16 @@ function renderMonitorCharts(metrics, summary) {
 
   // 统计卡片（后端预计算）
   const stats = metrics.stats || {};
-  // TTFT 分位数卡片：优先整轮区间删失 MLE 拟合值（修正直方图宽桶
-  // 线性插值误差）；无拟合数据（旧报告/拟合失败）回退 Prometheus 统计
-  const fitP50 = summary && summary.ttft_p50_fit_s != null
-    ? summary.ttft_p50_fit_s * 1000 : null;
-  const fitP95 = summary && summary.ttft_p95_fit_s != null
-    ? summary.ttft_p95_fit_s * 1000 : null;
   const cards = [
-    ["平均生成吞吐", fmt(stats.gen_throughput_avg), "tok/s"],
     ["峰值生成吞吐", fmt(stats.gen_throughput_peak), "tok/s"],
-    fitP50 != null
-      ? ["TTFT p50（拟合）", fmt(fitP50), "ms"]
-      : ["平均 TTFT p50", fmt(stats.ttft_p50_avg_ms), "ms"],
-    fitP95 != null
-      ? ["TTFT p95（拟合）", fmt(fitP95), "ms"]
-      : ["峰值 TTFT p95", fmt(stats.ttft_p95_peak_ms), "ms"],
     ["KV cache 峰值", fmt(stats.kv_cache_peak_perc), "%"],
     // 抢占卡片：新报告显示精确累计次数（vLLM counter 差分）；
     // 旧报告/实时监控无该数据时回退显示 Prometheus 抢占速率峰值
     summary && summary.preemptions_total != null
       ? ["累计抢占次数", fmt(summary.preemptions_total), "次"]
       : ["抢占速率峰值", fmt(stats.preemptions_rate_peak), "req/s"],
+    // GPU 显存使用率（DCGM，各卡平均，整轮时间平均）
+    ["GPU 显存使用率", fmt(stats.gpu_fb_usage_avg), "%"],
   ];
   $("monitorCards").innerHTML = cards.map(([label, val, unit]) =>
     `<div class="monitor-card">
@@ -550,9 +625,10 @@ function renderMonitorCharts(metrics, summary) {
        <div class="monitor-card-label">${label}</div>
      </div>`).join("");
 
-  // 分组折线图（同 group 画同一张图）
+  // 分组折线图（同 group 画同一张图；hidden 序列只算统计不进图）
   const groups = {};
   (metrics.series || []).forEach((s) => {
+    if (s.hidden) return;
     (groups[s.group] = groups[s.group] || []).push(s);
   });
   const wrap = $("monitorCharts");
@@ -577,53 +653,37 @@ function renderMonitorCharts(metrics, summary) {
     wrap.appendChild(card);
 
     // 数据变换：时间戳 s → ms（ECharts time 轴用毫秒）；
-    // cache 组 0-1 → 百分比；latency 组 s → ms
+    // kv_cache_usage 0-1 → 百分比；延迟类序列（e2e/ttft/itl/tpot/
+    // queue/prefill/decode）s → ms。按 key 判断而非 group：
+    // gpu 组内 kv_cache 换算而 DCGM 序列不换算
+    const LATENCY_KEY_RE = /^(e2e_p|ttft_p|itl_p|tpot_avg|queue_p|prefill_p|decode_p)/;
     const transform = (s) => {
       let data = (s.data || []).map(([t, v]) => [t * 1000, v]);
-      if (s.group === "cache") data = data.map(([t, v]) => [t, +(v * 100).toFixed(2)]);
-      if (s.group === "latency") data = data.map(([t, v]) => [t, +(v * 1000).toFixed(1)]);
-      return data;
+      // null（直方图窗口内无观测 → NaN）必须保留：JS 中 null * 1000 === 0，
+      // 直接参与算术会把"无数据"画成 0；保留的 null 由 bridgeShortGaps
+      // 决定断线（长间隙）或桥接（≤45s 的波间静默空洞）
+      if (s.key === "kv_cache_usage")
+        data = data.map(([t, v]) => [t, v == null ? null : +(v * 100).toFixed(2)]);
+      if (LATENCY_KEY_RE.test(s.key))
+        data = data.map(([t, v]) => [t, v == null ? null : +(v * 1000).toFixed(1)]);
+      return bridgeShortGaps(data);
     };
-    const unit = seriesList[0].unit === "%" ? "%" :
-      (g === "latency" ? "ms" : seriesList[0].unit);
+    const LATENCY_GROUPS = ["e2e", "latency", "itl", "phase"];
+    const unit = g === "gpu" ? "%" :
+      (LATENCY_GROUPS.includes(g) ? "ms" : seriesList[0].unit);
 
-    // phase 组双 Y 轴：Prefill 耗时远小于 Decode，共用一根轴时 Prefill 曲线
-    // 会贴着 x 轴看不出走势 → Prefill 走左轴、Decode 走右轴，各自独立刻度。
-    // 轴与曲线颜色绑定（蓝=Prefill，绿=Decode），p50 浅色 / p95 深色
-    const isPrefill = (s) => /^prefill/i.test(s.legend);
-    const dualAxis = g === "phase" &&
-      seriesList.some(isPrefill) && seriesList.some((s) => !isPrefill(s));
-    const phaseColor = (s) => {
-      const deep = /p95/i.test(s.legend);
-      return isPrefill(s) ? (deep ? "#2563eb" : "#93c5fd")
-                          : (deep ? "#16a34a" : "#86efac");
-    };
-
-    // 单轴公共配置（非双轴组沿用）
+    // 单轴公共配置：gpu 组三条曲线均为 0-100 百分比，固定量程从 0 起
     const axisCommon = {
       type: "value",
       nameGap: 10,
-      scale: g !== "cache",
-      max: g === "cache" ? 100 : undefined,
+      scale: g !== "gpu",
+      max: g === "gpu" ? 100 : undefined,
       axisLabel: {
         formatter: (v) => v >= 10000 ? (v / 1000) + "k" : v,
       },
     };
-    let yAxis;
-    if (dualAxis) {
-      yAxis = [
-        { ...axisCommon, name: `Prefill (${unit})`, position: "left",
-          nameTextStyle: { color: "#2563eb", fontSize: 11 },
-          axisLabel: { ...axisCommon.axisLabel, color: "#2563eb" } },
-        { ...axisCommon, name: `Decode (${unit})`, position: "right",
-          nameTextStyle: { color: "#16a34a", fontSize: 11 },
-          axisLabel: { ...axisCommon.axisLabel, color: "#16a34a" },
-          splitLine: { show: false } },   // 只保留左轴网格线，避免两套横线交叉
-      ];
-    } else {
-      yAxis = { ...axisCommon, name: unit,
-        nameTextStyle: { color: "#94a3b8", fontSize: 11 } };
-    }
+    const yAxis = { ...axisCommon, name: unit,
+      nameTextStyle: { color: "#94a3b8", fontSize: 11 } };
 
     pending.push({
       el: chartEl,
@@ -635,9 +695,8 @@ function renderMonitorCharts(metrics, summary) {
           valueFormatter: (v) => v == null ? "—" : `${(+v).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`,
         },
         legend: seriesList.length > 1 ? { bottom: 0, icon: "rect", itemWidth: 14, itemHeight: 4 } : undefined,
-        // 底部留白统一 56px：有图例时时间轴上移避开图例，无图例时同高对齐；
-        // 双轴时右侧需给右轴刻度留位
-        grid: { left: 56, right: dualAxis ? 56 : 24, top: 32, bottom: 56 },
+        // 底部留白统一 56px：有图例时时间轴上移避开图例，无图例时同高对齐
+        grid: { left: 56, right: 24, top: 32, bottom: 56 },
         xAxis: {
           type: "time",
           axisLabel: { hideOverlap: true, formatter: "{HH}:{mm}:{ss}" },
@@ -650,7 +709,6 @@ function renderMonitorCharts(metrics, summary) {
           data: transform(s),
           lineStyle: { width: 1.6 },
           emphasis: { focus: "series" },
-          ...(dualAxis ? { yAxisIndex: isPrefill(s) ? 0 : 1, color: phaseColor(s) } : {}),
         })),
       },
     });
@@ -688,6 +746,7 @@ async function enterReportMode(taskName) {
   if (!r || !r.success) return alert((r && r.error) || "加载历史任务失败");
   renderReport(r.config || {}, r.result || {});
   loadMonitorCharts(taskName, r.config || {}, r.result || {});
+  loadAnalysis(taskName);
   renderHistoryList();
 }
 
@@ -705,6 +764,7 @@ async function enterStatusView(taskName) {
   $("btnBackStatus").style.display = "none";   // 已在状态页
   closeCaseModal();
   hideMonitor();   // 监控图表仅报告模式显示
+  hideAnalysis();  // AI 分析仅报告模式显示
   $("progressList").style.display = "";
   const r = await fetchJSON(`/api/tests/text/history/${encodeURIComponent(taskName)}`);
   if (!r || !r.success) return alert((r && r.error) || "加载历史任务失败");
@@ -842,6 +902,7 @@ $("btnNewTextTest").addEventListener("click", () => {
   textStatusViewTask = null;                  // 退出状态视图，恢复轮询渲染
   statusViewResult = null;
   hideMonitor();   // 监控图表仅报告模式显示
+  hideAnalysis();  // AI 分析仅报告模式显示
   setRunningUI(false);
   restartPolling();
   renderHistoryList();
@@ -1235,7 +1296,7 @@ function renderVllmBar(m, mode = "live") {
   const el = $("vllmBarItems");
   bar.style.display = "block";
   $("vllmBarTitle").textContent =
-    mode === "live" ? "vLLM 指标（快照）" : "服务端指标";
+    mode === "live" ? "vLLM 指标（快照）" : "Metrics";
   if (!m) {
     el.innerHTML = '<div class="detail-item"><span class="detail-v">' +
       (mode === "live" ? "指标采集中…" : "暂无指标数据") + '</span></div>';
@@ -1256,14 +1317,14 @@ function renderVllmBar(m, mode = "live") {
     // E2E/命中率为终值差分（请求等权），tokens/抢占为累计值
     const g = reportGpuStats || {};
     const groups = [
-      ["业务指标 · 时延与并发", [
+      ["业务指标", [
         ["平均首 token 延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
         ["平均逐 token 延迟", m.tpot_avg_s == null ? "—" : `${m.tpot_avg_s} s/tok`],
         ["端到端延迟", m.e2e_avg_s == null ? "—" : `${m.e2e_avg_s} s`],
         ["运行中请求峰值", num(m.running_requests_max)],
         ["排队请求峰值", num(m.waiting_requests_max)],
       ]],
-      ["技术指标 · 吞吐与引擎", [
+      ["技术指标", [
         ["平均生成吞吐", m.gen_throughput_toks_avg == null ? "—" : `${num(m.gen_throughput_toks_avg)} tok/s`],
         ["平均 Prefill 耗时", m.prefill_avg_s == null ? "—" : `${m.prefill_avg_s} s`],
         ["平均 Decode 耗时", m.decode_avg_s == null ? "—" : `${m.decode_avg_s} s`],
@@ -1271,11 +1332,11 @@ function renderVllmBar(m, mode = "live") {
         ["平均前缀缓存命中", pct(m.prefix_cache_hit_rate_avg)],
         ["累计抢占次数", num(m.preemptions_total)],
       ]],
-      ["资源指标 · GPU 显存（各卡平均）", [
+      ["资源指标", [
         ["显存使用率", pctRaw(g.gpu_fb_usage_avg)],
         ["显存控制器使用率", pctRaw(g.gpu_mem_copy_util_avg)],
       ]],
-      ["统计指标 · Token 累计", [
+      ["统计指标", [
         ["累计输入 tokens", num(m.prompt_tokens_total)],
         ["累计生成 tokens", num(m.generation_tokens_total)],
       ]],
