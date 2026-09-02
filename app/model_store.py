@@ -163,6 +163,18 @@ def get_server_port() -> int:
     return DEFAULT_SERVER_PORT
 
 
+# ==================== 日志开关 ====================
+
+def get_log_enabled() -> bool:
+    """读取日志开关（config.json → log.enabled，默认关闭）。
+
+    每次调用都从磁盘读取，修改 config.json 后即时生效，无需重启。
+    """
+    with _lock:
+        data = _load_all()
+    return bool((data.get("log") or {}).get("enabled", False))
+
+
 # ==================== Prometheus 配置 ====================
 
 def get_prometheus_config() -> dict:

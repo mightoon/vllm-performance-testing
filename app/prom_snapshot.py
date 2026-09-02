@@ -13,6 +13,7 @@ import time
 
 import httpx
 
+from . import applog
 from . import workspace
 
 # 指标清单：group 相同的序列前端渲染为同一张图（每行两图，共四行：
@@ -279,6 +280,7 @@ def _to_f(v) -> float:
 async def fetch_snapshot(base_url: str, start: float, end: float) -> dict:
     """按起止时间拉取全部指标，组装快照 dict。单条失败跳过，不整体失败。
     Prometheus 不可达时静默返回空快照，不抛异常。"""
+    t0 = time.time()
     try:
         step = _step_for(start, end)
         series = []
@@ -298,6 +300,8 @@ async def fetch_snapshot(base_url: str, start: float, end: float) -> dict:
                     # Prometheus 返回的 value 为字符串，转 float（NaN → None）
                     "data": [[t, _to_f(v)] for t, v in values],
                 })
+        applog.log("metrics", f"Prometheus 快照拉取完成 url={base_url} "
+                   f"耗时={time.time() - t0:.1f}s series={len(series)}/{len(METRICS)}")
         return {
             "schema_version": 1,
             "source": base_url,
@@ -306,7 +310,9 @@ async def fetch_snapshot(base_url: str, start: float, end: float) -> dict:
             "series": series,
             "stats": _compute_stats(series),
         }
-    except Exception:
+    except Exception as e:
+        applog.log("metrics", f"Prometheus 快照拉取失败 url={base_url} "
+                   f"耗时={time.time() - t0:.1f}s error={type(e).__name__}: {e}")
         return {
             "schema_version": 1,
             "source": base_url,
@@ -324,9 +330,14 @@ async def test_connection(base_url: str) -> dict:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(url, params={"query": "up"})
         if resp.status_code == 200 and resp.json().get("status") == "success":
+            applog.log("metrics", f"Prometheus 连通性测试成功 url={base_url}")
             return {"success": True}
+        applog.log("metrics", f"Prometheus 连通性测试失败 url={base_url} "
+                   f"error=HTTP {resp.status_code}")
         return {"success": False, "error": f"HTTP {resp.status_code}"}
     except Exception as e:
+        applog.log("metrics", f"Prometheus 连通性测试失败 url={base_url} "
+                   f"error={type(e).__name__}: {e}")
         return {"success": False, "error": str(e)}
 
 

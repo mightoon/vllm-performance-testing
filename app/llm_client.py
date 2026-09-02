@@ -2,8 +2,11 @@
 import asyncio
 import json
 import re
+import time
 
 import httpx
+
+from . import applog
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +112,12 @@ async def chat_completion(base_url: str, model: str, messages: list,
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    t0 = time.time()
+    applog.log("llm", f"chat_completion 开始 model={model} url={url} "
+               f"messages={len(messages)} prompt_chars="
+               f"{sum(len(m.get('content') or '') for m in messages)} "
+               f"max_tokens={max_tokens}")
+
     try:
         client = _get_client(base_url, api_key)
         try:
@@ -127,6 +136,8 @@ async def chat_completion(base_url: str, model: str, messages: list,
                 content = data["choices"][0]["message"]["content"] or ""
             except (KeyError, IndexError, TypeError):
                 pass
+            applog.log("llm", f"chat_completion 成功 model={model} "
+                       f"耗时={time.time() - t0:.1f}s content_chars={len(content)}")
             return {"success": True, "content": content}
         # 错误处理：提取可读信息
         try:
@@ -134,17 +145,26 @@ async def chat_completion(base_url: str, model: str, messages: list,
             detail = err.get("error", {}).get("message", "") or resp.text[:200]
         except Exception:
             detail = resp.text[:200]
+        applog.log("llm", f"chat_completion 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s "
+                   f"error=HTTP {resp.status_code}: {detail}")
         return {"success": False, "error": f"HTTP {resp.status_code}: {detail}"}
     except httpx.TimeoutException as e:
         # 注意：客户端超时放弃后，服务端往往仍会完成请求并记录 200，
         # 所以 vLLM 日志全 200 与此错误不矛盾。带异常子类便于区分
         # ConnectTimeout/ReadTimeout/WriteTimeout/PoolTimeout。
+        applog.log("llm", f"chat_completion 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s error=请求超时（{type(e).__name__}）")
         return {"success": False, "error": f"请求超时（{type(e).__name__}）"}
     except httpx.ConnectError as e:
+        applog.log("llm", f"chat_completion 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s error=无法连接 {url}")
         return {"success": False, "error": f"无法连接到服务器（检查 base_url）: {e}"}
     except Exception as e:
         # 覆盖：响应体不完整(RemoteProtocolError)、JSON 解析失败、
         # 连接被重置(ReadError)等——这些场景下 vLLM 端可能已记录 200
+        applog.log("llm", f"chat_completion 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s error={type(e).__name__}: {e}")
         return {"success": False, "error": f"{type(e).__name__}: {e}"}
 
 
@@ -205,6 +225,11 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
         headers["Authorization"] = f"Bearer {api_key}"
 
     full = []
+    t0 = time.time()
+    applog.log("llm", f"chat_stream 开始 model={model} url={url} "
+               f"messages={len(messages)} prompt_chars="
+               f"{sum(len(m.get('content') or '') for m in messages)} "
+               f"max_tokens={max_tokens}")
 
     async def _stream_once(client: httpx.AsyncClient) -> dict:
         async with client.stream("POST", url, json=payload,
@@ -241,19 +266,30 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
     try:
         client = _get_client(base_url, api_key)
         try:
-            return await _stream_once(client)
+            r = await _stream_once(client)
         except _STALE_CONN_ERRORS:
             if full:
                 raise  # 已收到部分数据，重试会导致内容重复
             # keep-alive 连接可能已被服务端关闭，重建后重试一次
             _drop_client(base_url, api_key)
-            return await _stream_once(_get_client(base_url, api_key))
+            r = await _stream_once(_get_client(base_url, api_key))
     except httpx.TimeoutException as e:
+        applog.log("llm", f"chat_stream 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s error=请求超时（{type(e).__name__}）")
         return {"success": False, "error": f"请求超时（{type(e).__name__}）"}
     except httpx.ConnectError as e:
+        applog.log("llm", f"chat_stream 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s error=无法连接 {url}")
         return {"success": False, "error": f"无法连接到服务器（检查 base_url）: {e}"}
     except Exception as e:
+        applog.log("llm", f"chat_stream 失败 model={model} "
+                   f"耗时={time.time() - t0:.1f}s error={type(e).__name__}: {e}")
         return {"success": False, "error": f"{type(e).__name__}: {e}"}
+    applog.log("llm", f"chat_stream {'成功' if r['success'] else '失败'} model={model} "
+               f"耗时={time.time() - t0:.1f}s "
+               + (f"content_chars={len(r['content'])}" if r["success"]
+                  else f"error={r['error']}"))
+    return r
 
 
 def _metrics_url(base_url: str) -> str:
@@ -439,6 +475,8 @@ async def probe_model_info(base_url: str, model: str, api_key: str = "",
     root = _root_url(base_url)
     version = None
     kv_tokens = None
+    t0 = time.time()
+    applog.log("llm", f"probe 开始 model={model} url={base_url}")
 
     async def _get(url: str):
         client = _get_client(base_url, api_key)
@@ -502,6 +540,9 @@ async def probe_model_info(base_url: str, model: str, api_key: str = "",
     except Exception:
         pass
 
+    applog.log("llm", f"probe 完成 model={model} 耗时={time.time() - t0:.1f}s "
+               f"version={version} max_model_len={max_model_len} "
+               f"kv_cache_tokens={kv_tokens}")
     return {"success": True, "version": version,
             "max_model_len": max_model_len, "kv_cache_tokens": kv_tokens}
 
@@ -517,6 +558,7 @@ async def fetch_vllm_metrics(base_url: str, api_key: str = "",
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    t0 = time.time()
     try:
         client = _get_client(base_url, api_key)
         try:
@@ -526,9 +568,17 @@ async def fetch_vllm_metrics(base_url: str, api_key: str = "",
             resp = await _get_client(base_url, api_key).get(
                 url, headers=headers, timeout=timeout)
         if resp.status_code != 200:
+            applog.log("metrics", f"vllm /metrics 失败 耗时={time.time() - t0:.1f}s "
+                       f"error=HTTP {resp.status_code}（{url}）")
             return {"success": False,
                     "error": f"HTTP {resp.status_code}（{url}）"}
-        return {"success": True,
-                "metrics": extract_vllm_metrics(_parse_prometheus(resp.text))}
+        m = extract_vllm_metrics(_parse_prometheus(resp.text))
+        applog.log("metrics", f"vllm /metrics 成功 耗时={time.time() - t0:.1f}s "
+                   f"running={m.get('running_requests')} "
+                   f"waiting={m.get('waiting_requests')} "
+                   f"kv_usage={m.get('gpu_cache_usage')}")
+        return {"success": True, "metrics": m}
     except Exception as e:
+        applog.log("metrics", f"vllm /metrics 失败 耗时={time.time() - t0:.1f}s "
+                   f"error={type(e).__name__}: {e}")
         return {"success": False, "error": f"{type(e).__name__}: {e}"}

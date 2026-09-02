@@ -2,6 +2,9 @@
   "server": {
     "port": 8000
   },
+  "log": {
+    "enabled": true
+  },
   "models": [
     {
       "id": "c018133f",

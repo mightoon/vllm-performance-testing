@@ -29,10 +29,20 @@ python run.py
 ```json
 {
   "server": { "port": 5888 },
+  "log": { "enabled": false },
   "models": [],
   "prometheus": { "url": "", "grafana_url": "" }
 }
 ```
+
+### 日志开关（排查问题用）
+
+`config.json` → `log.enabled` 改为 `true` 后**即时生效（无需重启）**，记录：
+每次 `/api/` 请求（方法/路径/状态/耗时）、每次大模型调用（chat/probe，
+含耗时与结果）、测试生命周期（启动/结束/case 状态）、Prometheus 快照、
+AI 分析生成过程（开始/模型调用/落盘/失败原因）等。
+
+日志文件：`logs/app.log`（exe 同目录或项目根目录，1MB × 5 轮转，UTF-8）。
 
 ### 方式二：python -m uvicorn 直接启动（端口由命令行指定）
 

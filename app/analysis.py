@@ -11,6 +11,7 @@ import os
 import time
 
 from . import model_store
+from . import applog
 from . import prom_snapshot
 from . import workspace
 from .llm_client import chat_completion
@@ -162,9 +163,11 @@ async def _run_and_save_impl(task_name: str,
             await prereq
         except Exception:
             pass
+    applog.log("analysis", f"开始生成 {task_name}")
     try:
         task = workspace.load_task(task_name)
         if task is None:
+            applog.log("analysis", f"失败 {task_name} error=任务不存在")
             return {"success": False, "error": "任务不存在"}
         summary = _collect_summary(task, task_name)
         # 被测模型即分析模型：从任务 config 取 model_id 查当前配置
@@ -172,21 +175,33 @@ async def _run_and_save_impl(task_name: str,
                     or task["config"].get("params", {}).get("model_id"))
         model = model_store.get_model(model_id) if model_id else None
         if model is None:
+            applog.log("analysis", f"失败 {task_name} error=被测模型配置已删除")
             return {"success": False, "error": "被测模型配置已删除，无法调用"}
         api_key = model_store.decode_key(model.get("api_key", ""))
+        applog.log("analysis", f"调用被测模型 {task_name} model={model['model']} "
+                   f"url={model['url']} max_tokens={_MAX_TOKENS}")
+        t0 = time.time()
         r = await chat_completion(
             base_url=model["url"], model=model["model"],
             messages=[{"role": "user", "content": build_prompt(summary)}],
             api_key=api_key, max_tokens=_MAX_TOKENS, timeout=_TIMEOUT,
         )
         if not r["success"]:
+            applog.log("analysis", f"失败 {task_name} 耗时={time.time() - t0:.1f}s "
+                       f"error={r['error']}")
             _save(task_name, summary, status="error", error=r["error"])
             return {"success": False, "error": r["error"]}
         content = (r.get("content") or "").strip()
         if not content:
+            applog.log("analysis", f"失败 {task_name} 耗时={time.time() - t0:.1f}s "
+                       f"error=模型返回空内容")
             _save(task_name, summary, status="error", error="模型返回空内容")
             return {"success": False, "error": "模型返回空内容"}
         analysis = _save(task_name, summary, status="done", content=content)
+        applog.log("analysis", f"完成 {task_name} 耗时={time.time() - t0:.1f}s "
+                   f"content_chars={len(content)} analysis.json 已保存")
         return {"success": True, "analysis": analysis}
     except Exception as e:
+        applog.log("analysis", f"异常 {task_name} "
+                   f"error={type(e).__name__}: {e}")
         return {"success": False, "error": f"{type(e).__name__}: {e}"}

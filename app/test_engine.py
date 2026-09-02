@@ -13,6 +13,7 @@ from . import model_store
 from .llm_client import chat_completion_stream, fetch_vllm_metrics
 from .noun_library import pick_nouns_pool
 from . import analysis
+from . import applog
 from . import prompt_templates
 from . import prom_snapshot
 from . import workspace
@@ -241,6 +242,8 @@ class TextTestEngine:
             # 探测失败为 None，旧任务无此字段，前端均显示 "—"
             "model_probe": probe,
         })
+        applog.log("test", f"启动测试 {self.task_name} "
+                   f"model={self._model.get('name')} params={self.params}")
         return {"success": True, "test_id": self.test_id, "task_name": self.task_name}
 
     def stop(self) -> dict:
@@ -256,6 +259,7 @@ class TextTestEngine:
                 c.status = "stopped"
                 c.finished_at = time.time()
         self._tasks = []
+        applog.log("test", f"用户停止测试 {self.task_name}")
         return {"success": True}
 
     # ---------- 状态查询 ----------
@@ -332,6 +336,9 @@ class TextTestEngine:
                 # 整轮 vLLM 指标统计（报告模式展示；区别于最后一次实时快照）
                 result["vllm_metrics_summary"] = self._vllm_metrics_summary()
                 workspace.save_result(self.task_name, result)
+                applog.log("test", f"测试结束 {self.task_name} status={self.status} "
+                           f"耗时={self.finished_at - self.started_at:.0f}s "
+                           f"cases={len(self.cases)} result.json 已保存")
             except OSError:
                 pass  # 磁盘写入失败不影响测试本身
         # 监控快照 + AI 分析：均后台执行，不阻塞结束流程。
@@ -340,6 +347,7 @@ class TextTestEngine:
         if self.task_name and self.started_at and self.finished_at:
             snap_task = asyncio.create_task(self._snapshot_metrics())
             asyncio.create_task(analysis.run_and_save(self.task_name, snap_task))
+            applog.log("test", f"后台任务已派发 {self.task_name}: 监控快照 + AI 分析")
 
     async def _snapshot_metrics(self):
         """测试结束后按起止时间拉取 Prometheus 指标快照。"""
@@ -347,13 +355,20 @@ class TextTestEngine:
             cfg = model_store.get_prometheus_config()
             url = cfg.get("url", "")
             if not url:
+                applog.log("metrics", f"快照跳过 {self.task_name}: 未配置 Prometheus")
                 return
             snap = await prom_snapshot.fetch_snapshot(
                 url, self.started_at, self.finished_at)
             if snap.get("series"):
                 prom_snapshot.save_metrics(self.task_name, snap)
-        except Exception:
-            pass  # 快照失败不影响测试结果
+                applog.log("metrics", f"快照已保存 {self.task_name}/metrics.json "
+                           f"series={len(snap['series'])}")
+            else:
+                applog.log("metrics", f"快照无数据 {self.task_name} "
+                           f"(series=0, range={self.started_at:.0f}~{self.finished_at:.0f})")
+        except Exception as e:
+            applog.log("metrics", f"快照失败 {self.task_name} "
+                       f"error={type(e).__name__}: {e}")
 
     async def _poll_vllm_metrics(self):
         """后台每 5 秒抓取一次 vLLM /metrics 主要指标。失败时记录错误信息。"""
@@ -366,8 +381,12 @@ class TextTestEngine:
                         self._apply_metrics_sample(r)
                     else:
                         self.vllm_metrics = {"error": r["error"]}
-                except Exception:
+                        applog.log("metrics", f"轮询失败 {self.task_name} "
+                                   f"error={r['error']}")
+                except Exception as e:
                     self.vllm_metrics = {"error": "vLLM 指标抓取异常"}
+                    applog.log("metrics", f"轮询异常 {self.task_name} "
+                               f"error={type(e).__name__}: {e}")
                 try:
                     # 可中断的 sleep：用户停止测试时立即退出
                     await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
@@ -628,6 +647,9 @@ class TextTestEngine:
             # 前端在 errors > 0 时会展示 last_error 供诊断）
             case.status = "completed"
             case.finished_at = time.time()
+            applog.log("test", f"case{case.case_id} 完成 {self.task_name} "
+                       f"loops={case.total_loops} errors={case.errors} "
+                       f"calls={case.completed_loops}")
         except asyncio.CancelledError:
             if case.status not in ("completed", "error"):
                 case.status = "stopped"
@@ -636,6 +658,8 @@ class TextTestEngine:
             case.add_error("内部异常", f"{type(e).__name__}: {e}")
             case.status = "error"
             case.finished_at = time.time()
+            applog.log("test", f"case{case.case_id} 异常 {self.task_name} "
+                       f"error={type(e).__name__}: {e}")
 
 
 

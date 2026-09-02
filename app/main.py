@@ -11,6 +11,7 @@ from typing import Optional
 
 from . import _paths
 from . import analysis
+from . import applog
 from . import model_store
 from . import prom_snapshot
 from . import workspace
@@ -21,6 +22,19 @@ from .test_engine import text_engine
 _paths.ensure_config()
 
 app = FastAPI(title="LLM 测试平台")
+
+
+# API 访问日志：log.enabled 开启时记录每次 /api/ 请求（方法/路径/状态/耗时）。
+# 静态资源请求（页面/JS/CSS）不记录，避免轮询页面时刷屏
+@app.middleware("http")
+async def _log_api_requests(request, call_next):
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    t0 = time.time()
+    response = await call_next(request)
+    applog.log("api", f"{request.method} {request.url.path} -> "
+               f"{response.status_code} ({(time.time() - t0) * 1000:.0f}ms)")
+    return response
 
 # ==================== 模型管理 API ====================
 
@@ -42,6 +56,9 @@ def api_add_model(payload: ModelPayload):
         return JSONResponse({"success": False, "error": "名称、模型ID、Base URL 均不能为空"}, 400)
     m = model_store.add_model(payload.name.strip(), payload.model.strip(),
                               payload.url.strip(), payload.api_key or "")
+    applog.log("model", f"新增模型 id={m['id']} name={m['name']} "
+               f"model={m['model']} url={m['url']} "
+               f"api_key={'已设置' if m['has_api_key'] else '无'}")
     return {"success": True, "model": m}
 
 
@@ -56,6 +73,8 @@ def api_update_model(model_id: str, payload: ModelPayload):
     )
     if updated is None:
         return JSONResponse({"success": False, "error": "配置不存在"}, 404)
+    applog.log("model", f"更新模型 id={updated['id']} name={updated['name']} "
+               f"model={updated['model']} url={updated['url']}")
     return {"success": True, "model": updated}
 
 
@@ -64,6 +83,7 @@ def api_delete_model(model_id: str):
     ok = model_store.delete_model(model_id)
     if not ok:
         return JSONResponse({"success": False, "error": "配置不存在"}, 404)
+    applog.log("model", f"删除模型 id={model_id}")
     return {"success": True}
 
 
@@ -79,8 +99,11 @@ def api_get_apikey(model_id: str):
 async def api_verify_model(payload: ModelPayload):
     if not payload.model or not payload.url:
         return {"success": False, "error": "模型ID 和 Base URL 不能为空"}
-    return await verify_connection(payload.url.strip(), payload.model.strip(),
-                                   payload.api_key or "")
+    r = await verify_connection(payload.url.strip(), payload.model.strip(),
+                                payload.api_key or "")
+    applog.log("model", f"验证连接 model={payload.model} url={payload.url} "
+               f"result={'成功' if r['success'] else '失败: ' + r.get('error', '')}")
+    return r
 
 
 # ==================== 模型服务端能力探测 ====================
@@ -287,6 +310,7 @@ def api_text_history_delete(task_name: str):
         return JSONResponse({"success": False, "error": f"删除失败：{e}"}, 500)
     if not ok:
         return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    applog.log("test", f"删除历史任务 {task_name}")
     return {"success": True}
 
 
@@ -310,6 +334,8 @@ def api_prom_config_put(payload: PromConfigPayload):
     if not url.startswith(("http://", "https://")):
         return JSONResponse({"success": False, "error": "URL 需以 http:// 或 https:// 开头"}, 400)
     cfg = model_store.save_prometheus_config(url, payload.grafana_url or "")
+    applog.log("model", f"保存 Prometheus 配置 url={url} "
+               f"grafana_url={payload.grafana_url or '无'}")
     return {"success": True, "config": cfg}
 
 
