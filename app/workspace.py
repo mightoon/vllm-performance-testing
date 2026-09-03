@@ -74,6 +74,11 @@ def save_result(task_name: str, result: dict) -> None:
             with open(cfg_path, encoding="utf-8") as f:
                 cfg = json.load(f)
             cfg["status"] = result.get("status", "")
+            # 实测平均输入 token（图形测试：API usage 精确值/差分估算；
+            # 回写到 config 供历史列表小字展示，避免逐任务读 result.json）
+            pt_avg = (result.get("summary") or {}).get("prompt_tokens_avg")
+            if pt_avg is not None:
+                cfg["input_tokens_avg"] = pt_avg
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except (OSError, ValueError):
@@ -103,6 +108,8 @@ def list_history(kind: str) -> list:
             "status": cfg.get("status", ""),
             "has_result": has_result,
             "params": cfg.get("params", {}),
+            # 实测平均输入 token（图形测试历史小字；文本测试无此字段）
+            "input_tokens_avg": cfg.get("input_tokens_avg"),
         })
     items.sort(key=lambda x: x["started_at"], reverse=True)
     return items

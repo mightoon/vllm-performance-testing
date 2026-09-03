@@ -193,7 +193,8 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
                                  api_key: str = "", max_tokens: int = 2048,
                                  timeout: float = 600.0,
                                  temperature: float | None = None,
-                                 on_chunk=None) -> dict:
+                                 on_chunk=None,
+                                 include_usage: bool = False) -> dict:
     """流式调用 chat/completions（SSE），边生成边通过 on_chunk 回调增量文本。
 
     相比非流式：read timeout 作用于相邻 chunk 之间而非整个请求，
@@ -201,9 +202,13 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
 
     Args:
         on_chunk: 回调 fn(delta_text: str)，在 asyncio 事件循环内同步调用。
+        include_usage: 请求 stream_options.include_usage，流末尾返回每请求
+                       精确 usage（prompt_tokens 等，vLLM 0.5+ / OpenAI 支持）。
+                       老版本服务不识别该字段返回 400 时自动去掉重试一次。
 
     Returns:
-        {"success": True, "content": 完整文本} 或 {"success": False, "error": str}
+        {"success": True, "content": 完整文本, "usage": dict|None} 或
+        {"success": False, "error": str}
     """
     url = base_url.rstrip("/")
     if not url.endswith("/chat/completions"):
@@ -219,19 +224,25 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
     }
     if temperature is not None:
         payload["temperature"] = temperature
+    if include_usage:
+        # 流末尾追加一个带 usage 的空 chunk（choices=[]），取每请求
+        # 精确 prompt_tokens；老版本不识别会 400，由下方回退重试兜底
+        payload["stream_options"] = {"include_usage": True}
 
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
     full = []
+    usage = None
     t0 = time.time()
     applog.log("llm", f"chat_stream 开始 model={model} url={url} "
                f"messages={len(messages)} prompt_chars="
-               f"{sum(len(m.get('content') or '') for m in messages)} "
+               f"{sum(len(m.get('content') or '') if isinstance(m.get('content'), str) else 0 for m in messages)} "
                f"max_tokens={max_tokens}")
 
     async def _stream_once(client: httpx.AsyncClient) -> dict:
+        nonlocal usage
         async with client.stream("POST", url, json=payload,
                                  headers=headers, timeout=timeout) as resp:
             if resp.status_code != 200:
@@ -251,8 +262,14 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
                     break
                 try:
                     obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                # usage chunk（include_usage 时流末尾追加，choices 为空数组）
+                if isinstance(obj.get("usage"), dict):
+                    usage = obj["usage"]
+                try:
                     delta = obj["choices"][0]["delta"].get("content") or ""
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                except (KeyError, IndexError, TypeError):
                     continue
                 if delta:
                     full.append(delta)
@@ -261,7 +278,7 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
                             on_chunk(delta)
                         except Exception:
                             pass
-        return {"success": True, "content": "".join(full)}
+        return {"success": True, "content": "".join(full), "usage": usage}
 
     try:
         client = _get_client(base_url, api_key)
@@ -273,6 +290,14 @@ async def chat_completion_stream(base_url: str, model: str, messages: list,
             # keep-alive 连接可能已被服务端关闭，重建后重试一次
             _drop_client(base_url, api_key)
             r = await _stream_once(_get_client(base_url, api_key))
+        # 老版本服务不识别 stream_options 返回 400：去掉该字段重试一次
+        # （usage 置 None，调用方回退用 /metrics 差分估算输入 token）
+        if (not r["success"] and include_usage
+                and "stream_options" in (r.get("error") or "")):
+            payload.pop("stream_options", None)
+            full.clear()
+            usage = None
+            r = await _stream_once(client)
     except httpx.TimeoutException as e:
         applog.log("llm", f"chat_stream 失败 model={model} "
                    f"耗时={time.time() - t0:.1f}s error=请求超时（{type(e).__name__}）")

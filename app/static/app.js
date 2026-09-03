@@ -534,20 +534,29 @@ function pollAnalysis(taskName) {
 }
 
 function renderAnalysis(a) {
+  renderAnalysisInto($("analysisBody"), $("analysisMeta"), a);
+}
+
+/* 参数化版本：图形测试传自己的分析区域元素 */
+function renderAnalysisInto(bodyEl, metaEl, a) {
   if (a.status === "done" && a.content) {
-    $("analysisBody").innerHTML = `<div class="analysis-md">${renderMarkdown(a.content)}</div>`;
-    $("analysisMeta").textContent = a.generated_at
+    bodyEl.innerHTML = `<div class="analysis-md">${renderMarkdown(a.content)}</div>`;
+    metaEl.textContent = a.generated_at
       ? `（${new Date(a.generated_at * 1000).toLocaleString()} 生成）` : "";
   } else {
-    $("analysisBody").innerHTML =
+    bodyEl.innerHTML =
       `<div class="analysis-empty">分析失败：${escapeHtml(a.error || "未知错误")}</div>`;
-    $("analysisMeta").textContent = "";
+    metaEl.textContent = "";
   }
 }
 
 /* Grafana 跳转链接（配置了 Grafana URL 时显示，带测试起止时间） */
 async function updateGrafanaLink(config, result) {
-  const link = $("grafanaLink");
+  await updateGrafanaLinkInto($("grafanaLink"), config, result);
+}
+
+/* 参数化版本：图形测试传自己的链接元素 */
+async function updateGrafanaLinkInto(link, config, result) {
   link.style.display = "none";
   try {
     const r = await fetchJSON("/api/prometheus/config");
@@ -603,6 +612,12 @@ function bridgeShortGaps(data) {
 }
 
 function renderMonitorCharts(metrics, summary) {
+  renderMonitorChartsInto($("monitorCards"), $("monitorCharts"),
+                          metrics, summary, monitorChartInstances);
+}
+
+/* 参数化版本：文本/图形测试共用（图形测试传自己的卡片/图表容器与实例数组） */
+function renderMonitorChartsInto(cardsEl, wrap, metrics, summary, instances) {
   const fmt = (v) => v == null ? "—" :
     v.toLocaleString(undefined, { maximumFractionDigits: 1 });
 
@@ -619,7 +634,7 @@ function renderMonitorCharts(metrics, summary) {
     // GPU 显存使用率（DCGM，各卡平均，整轮时间平均）
     ["GPU 显存使用率", fmt(stats.gpu_fb_usage_avg), "%"],
   ];
-  $("monitorCards").innerHTML = cards.map(([label, val, unit]) =>
+  cardsEl.innerHTML = cards.map(([label, val, unit]) =>
     `<div class="monitor-card">
        <div class="monitor-card-val">${val}<span class="monitor-card-unit">${unit}</span></div>
        <div class="monitor-card-label">${label}</div>
@@ -631,7 +646,6 @@ function renderMonitorCharts(metrics, summary) {
     if (s.hidden) return;
     (groups[s.group] = groups[s.group] || []).push(s);
   });
-  const wrap = $("monitorCharts");
   wrap.innerHTML = "";
   const groupKeys = MONITOR_GROUP_ORDER.filter((g) => groups[g])
     .concat(Object.keys(groups).filter((g) => !MONITOR_GROUP_ORDER.includes(g)));
@@ -719,7 +733,7 @@ function renderMonitorCharts(metrics, summary) {
     pending.forEach(({ el, option }) => {
       if (!el.isConnected) return;  // DOM 已被重建（快速切换任务）则跳过
       const chart = echarts.init(el);
-      monitorChartInstances.push(chart);
+      instances.push(chart);
       chart.setOption(option);
       chart.resize();
     });
@@ -1292,10 +1306,14 @@ function vllmGridHtml(rows) {
 }
 
 function renderVllmBar(m, mode = "live") {
-  const bar = $("vllmBar");
-  const el = $("vllmBarItems");
+  renderVllmBarInto($("vllmBar"), $("vllmBarItems"), $("vllmBarTitle"),
+                    m, mode, reportGpuStats);
+}
+
+/* 参数化版本：文本/图形测试共用（图形测试传自己的指标条元素与 GPU 数据） */
+function renderVllmBarInto(bar, el, titleEl, m, mode = "live", gpuStats = null) {
   bar.style.display = "block";
-  $("vllmBarTitle").textContent =
+  titleEl.textContent =
     mode === "live" ? "vLLM 指标（快照）" : "Metrics";
   if (!m) {
     el.innerHTML = '<div class="detail-item"><span class="detail-v">' +
@@ -1315,7 +1333,7 @@ function renderVllmBar(m, mode = "live") {
     // 整轮统计四组：业务（时延/并发）→ 技术（引擎/缓存）→ 资源（GPU 显存）
     // → 统计（token 累计）。请求类取峰值，吞吐/缓存占用取均值；TTFT/TPOT/
     // E2E/命中率为终值差分（请求等权），tokens/抢占为累计值
-    const g = reportGpuStats || {};
+    const g = gpuStats || {};
     const groups = [
       ["业务指标", [
         ["平均首 token 延迟", m.ttft_avg_s == null ? "—" : `${m.ttft_avg_s} s`],
@@ -1518,6 +1536,7 @@ function buildErrorTooltip(c) {
       where += ` · 第 ${r.loop}${total ? "/" + total : ""} 轮`;
     }
     if (r.noun) where += ` · 名词「${escapeHtml(r.noun)}」`;
+    if (r.image) where += ` · 图片「${escapeHtml(r.image)}」`;
     if (r.duration) where += ` · 耗时 ${r.duration}s`;
     return `<div class="err-item">
       <div class="err-meta"><span class="err-time">${t}</span> ${where}</div>

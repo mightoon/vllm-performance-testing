@@ -79,7 +79,7 @@ body {
 /* ============ 历史测试侧栏（tab 左边栏） ============ */
 /* 侧栏通过负外边距悬挂在内容容器左侧的空白处，
    主区域（参数/状态 panel）保持与未加侧栏时相同的原始宽度 */
-#panel-text.active { display: flex; gap: 20px; align-items: flex-start; }
+#panel-text.active, #panel-image.active, #panel-video.active { display: flex; gap: 20px; align-items: flex-start; }
 
 .history-sidebar {
   width: 262.5px;          /* 原 210px 扩为 5/4 */
@@ -186,6 +186,21 @@ body {
   margin-top: 3px;
   font-size: 11px;
   color: var(--text-sub);
+}
+
+/* 两行小字（图形/视频测试）：第一行 状态+并发数，第二行 输入/输出 token */
+.history-item-meta.two-line {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.history-item-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .history-item-status {
@@ -1050,3 +1065,131 @@ body {
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: #cdd3e0; border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ============ 图形测试：参数区"测试图片" ============ */
+.image-dir-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.btn-pick-dir {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.btn-pick-dir:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--card);
+}
+/* 已选目录路径显示：单行省略，hover 看全称（title） */
+.image-dir-label {
+  font-size: 12px;
+  color: var(--text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-height: 15px;
+}
+.image-dir-label.has-dir { color: var(--text); }
+
+/* ============ 图片目录选择弹窗 ============ */
+.dir-picker-card { width: 640px; }
+
+.dir-picker-body { padding: 14px 22px 18px; overflow-y: auto; }
+
+.dir-nav {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.btn-dir-up {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all .15s;
+}
+.btn-dir-up:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.btn-dir-up:disabled { opacity: .45; cursor: not-allowed; }
+
+/* 当前路径：等宽字体便于辨认，单行省略 */
+.dir-path {
+  flex: 1;
+  min-width: 0;
+  font-family: Consolas, Monaco, monospace;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dir-list {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.dir-empty {
+  padding: 28px;
+  text-align: center;
+  color: var(--text-sub);
+  font-size: 13px;
+}
+.dir-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+  transition: background .12s;
+}
+.dir-item:last-child { border-bottom: none; }
+.dir-item:hover { background: var(--bg); }
+.dir-item-icon { flex-shrink: 0; }
+.dir-item-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dir-item-count {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-sub);
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+
+.dir-picker-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+.dir-images-info { font-size: 13px; color: var(--text-sub); }
+.dir-images-info b { color: var(--text); }
+.dir-warn { color: var(--danger); }
+.dir-picker-footer .form-actions { margin-top: 0; }

@@ -45,18 +45,34 @@ def _collect_summary(task: dict, task_name: str) -> dict:
     p = cfg.get("params", {})
     probe = cfg.get("model_probe") or {}
     rs = result.get("summary") or {}
-    return {
-        "profile": {
-            "model": p.get("model_name") or (cfg.get("model") or {}).get("name"),
-            "vllm_version": probe.get("version"),
-            "max_model_len": probe.get("max_model_len"),
-            "kv_cache_tokens": probe.get("kv_cache_tokens"),
+    profile = {
+        "model": p.get("model_name") or (cfg.get("model") or {}).get("name"),
+        "vllm_version": probe.get("version"),
+        "max_model_len": probe.get("max_model_len"),
+        "kv_cache_tokens": probe.get("kv_cache_tokens"),
+        "output_tokens_per_request": p.get("article_length"),
+        "concurrency": p.get("concurrency"),
+    }
+    if cfg.get("kind") == "图形测试":
+        # 图形测试：输入为图片（多模态），无输入长度档位
+        profile.update({
+            "test_type": "图形测试（图片理解 + 文章生成）",
+            "image_dir": p.get("image_dir"),
+            "images_in_dir": p.get("image_pool_size"),
+            "images_per_thread": p.get("image_count"),
+            # 每请求实测平均输入 token（图片 token 由服务端统计；
+            # usage 不可用时为 metrics 差分估算，见 image_engine）
+            "prompt_tokens_avg": rs.get("prompt_tokens_avg"),
+        })
+    else:
+        profile.update({
+            "test_type": "文本测试",
             "input_length": _LENGTH_LABELS.get(
                 p.get("input_length"), p.get("input_length")),
-            "output_tokens_per_request": p.get("article_length"),
             "iterations_per_thread": p.get("noun_count"),
-            "concurrency": p.get("concurrency"),
-        },
+        })
+    return {
+        "profile": profile,
         "test": {
             "status": result.get("status") or cfg.get("status"),
             "duration_s": result.get("elapsed"),
@@ -86,7 +102,13 @@ def build_prompt(summary: dict) -> str:
         "TTFT/ITL 长尾、前缀缓存命中率异常等；\n"
         "3. 指标间联系是否自洽：如 e2e_avg_s ≈ ttft_avg_s + 输出token数 × "
         "tpot_avg_s、总吞吐与并发×单流速度的匹配、排队对 TTFT 的抬升等交叉"
-        "验证，指出矛盾或异常之处。\n\n"
+        "验证，指出矛盾或异常之处。"
+        + ("（注意：这是图形测试，输入为图片多模态请求，图片输入 token 数"
+           "远大于文本 prompt，请结合 prompt_tokens_avg 评估图片 prefill "
+           "开销对 TTFT/吞吐的影响。）"
+           if (summary.get("profile") or {}).get("test_type") == "图形测试（图片理解 + 文章生成）"
+           else "")
+        + "\n\n"
         "要求：中文，500 字以内，直接给结论与依据，不要罗列原始数据，"
         "不要输出 JSON。"
     )

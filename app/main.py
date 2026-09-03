@@ -1,6 +1,8 @@
 """LLM 测试平台 - FastAPI 后端入口。"""
 import asyncio
 import json
+import os
+import sys
 import time
 
 from fastapi import FastAPI
@@ -17,6 +19,8 @@ from . import prom_snapshot
 from . import workspace
 from .llm_client import verify_connection
 from .test_engine import text_engine
+from .image_engine import image_engine
+from .video_engine import video_engine
 
 # PyInstaller 模式下首次运行时复制内置 config.json 到可执行文件目录
 _paths.ensure_config()
@@ -199,15 +203,14 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
-@app.get("/api/tests/text/case/{case_id}/stream")
-async def api_text_case_stream(case_id: int):
-    """单个 case 的 SSE 实时流：
+async def _case_stream_response(engine, case_id: int):
+    """单个 case 的 SSE 实时流（文本/图形测试引擎共用）：
     - snapshot: qa 结构变化（新问答开始/结束）时推送完整快照
     - delta:    正在生成的回答的文本增量（约 250ms 一批，实现平滑流式效果）
     - stats:    运行数据与端到端性能指标，每 5s 推送一次
     - end:      case 结束（完成/出错/停止）后推送并关闭流
     """
-    if text_engine.get_case(case_id) is None:
+    if engine.get_case(case_id) is None:
         return JSONResponse({"success": False, "error": "case 不存在"}, 404)
 
     async def event_stream():
@@ -216,22 +219,22 @@ async def api_text_case_stream(case_id: int):
         last_stats_ts = 0.0        # 上次推送 stats 的时间
         try:
             while True:
-                case = text_engine.get_case(case_id)
+                case = engine.get_case(case_id)
                 if case is None:
                     yield _sse("end", {})
                     return
 
                 # 测试结束或该 case 已终态 → 推最终快照并关闭
                 finished = (
-                    text_engine.status != "running"
+                    engine.status != "running"
                     or case.status in ("completed", "error", "stopped")
                 )
 
                 if finished or case.qa_version != last_version:
-                    detail = text_engine.case_detail(case_id)
+                    detail = engine.case_detail(case_id)
                     yield _sse("snapshot", {
                         "case": detail,
-                        "test_status": text_engine.status,
+                        "test_status": engine.status,
                     })
                     last_version = case.qa_version
                     last_lens = [len(q.get("partial") or "") for q in case.qa_history]
@@ -257,8 +260,8 @@ async def api_text_case_stream(case_id: int):
                 if now - last_stats_ts >= 5.0:
                     last_stats_ts = now
                     yield _sse("stats", {
-                        "case": text_engine.case_detail(case_id, include_qa=False),
-                        "test_status": text_engine.status,
+                        "case": engine.case_detail(case_id, include_qa=False),
+                        "test_status": engine.status,
                     })
 
                 await asyncio.sleep(0.25)
@@ -275,6 +278,11 @@ async def api_text_case_stream(case_id: int):
             "Connection": "keep-alive",
         },
     )
+
+
+@app.get("/api/tests/text/case/{case_id}/stream")
+async def api_text_case_stream(case_id: int):
+    return await _case_stream_response(text_engine, case_id)
 
 
 @app.post("/api/tests/text/stop")
@@ -388,6 +396,350 @@ def api_text_history_analysis(task_name: str):
         "success": True,
         "analysis": analysis.load_analysis(task_name),
         "pending": analysis.is_pending(task_name),
+    }
+
+
+# ==================== 图形测试 API ====================
+
+class ImageTestPayload(BaseModel):
+    model_id: str
+    image_dir: str
+    image_count: int = 5
+    article_length: int = 500
+    concurrency: int = 2
+
+
+@app.post("/api/tests/image/start")
+async def api_image_start(payload: ImageTestPayload):
+    image_dir = payload.image_dir.strip()
+    if not image_dir:
+        return JSONResponse({"success": False, "error": "请先选择图片目录"}, 400)
+    if payload.image_count < 1 or payload.image_count > 100:
+        return JSONResponse({"success": False, "error": "迭代次数需在 1-100 之间"}, 400)
+    if payload.article_length < 10 or payload.article_length > 10000:
+        return JSONResponse({"success": False, "error": "输出长度需在 10-10000 token 之间"}, 400)
+    if payload.concurrency < 1 or payload.concurrency > 1000:
+        return JSONResponse({"success": False, "error": "并发度需在 1-1000 之间"}, 400)
+    # 启动时刻快照模型服务端参数（报告 Profile 数据源；探测失败不阻塞启动）
+    probe = await _probe_model_cached(payload.model_id)
+    return image_engine.start(payload.model_id, image_dir,
+                              payload.image_count, payload.article_length,
+                              payload.concurrency, probe=probe)
+
+
+@app.get("/api/tests/image/status")
+def api_image_status():
+    return image_engine.status_dict()
+
+
+@app.get("/api/tests/image/case/{case_id}")
+def api_image_case_detail(case_id: int):
+    """单个 case 详情（含调用历史与端到端性能指标），供详情弹窗轮询。"""
+    detail = image_engine.case_detail(case_id)
+    if detail is None:
+        return JSONResponse({"success": False, "error": "case 不存在"}, 404)
+    return {
+        "success": True,
+        "case": detail,
+        "test_status": image_engine.status,
+    }
+
+
+@app.get("/api/tests/image/case/{case_id}/stream")
+async def api_image_case_stream(case_id: int):
+    return await _case_stream_response(image_engine, case_id)
+
+
+@app.post("/api/tests/image/stop")
+async def api_image_stop():
+    return image_engine.stop()
+
+
+@app.get("/api/tests/image/history")
+def api_image_history():
+    """历史图形测试任务列表（按开始时间倒序）。"""
+    return {"success": True, "tasks": workspace.list_history("图形测试")}
+
+
+@app.get("/api/tests/image/history/{task_name}")
+def api_image_history_detail(task_name: str):
+    """单个历史任务的完整配置与结果（报告模式数据源）。"""
+    task = workspace.load_task(task_name)
+    if task is None:
+        return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    return {"success": True, "config": task["config"], "result": task["result"]}
+
+
+@app.delete("/api/tests/image/history/{task_name}")
+def api_image_history_delete(task_name: str):
+    """删除历史任务：整体移除 workspace/<任务名>/ 目录（含结果与监控快照）。"""
+    # 运行中的任务禁止删除（目录正被引擎写入）
+    if (image_engine.task_name == task_name
+            and image_engine.status in ("running", "stopping")):
+        return JSONResponse({"success": False, "error": "任务运行中，无法删除"}, 409)
+    try:
+        ok = workspace.delete_task(task_name)
+    except OSError as e:
+        return JSONResponse({"success": False, "error": f"删除失败：{e}"}, 500)
+    if not ok:
+        return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    applog.log("test", f"删除历史图形测试任务 {task_name}")
+    return {"success": True}
+
+
+@app.get("/api/tests/image/history/{task_name}/metrics")
+async def api_image_history_metrics(task_name: str):
+    """报告模式监控数据。三级回退：快照 → 实时查询 → 空。"""
+    # 1. 快照优先（测试结束时存档，不受 TSDB 保留期限制）
+    snap = prom_snapshot.load_metrics(task_name)
+    if snap:
+        return {"success": True, "source": "snapshot", "metrics": snap}
+    # 2. 无快照但有 Prometheus 配置：按任务起止时间实时查询（15 天内有效）
+    url = model_store.get_prometheus_config().get("url", "")
+    if url:
+        task = workspace.load_task(task_name)
+        if task:
+            started = float(task["config"].get("started_at") or 0)
+            elapsed = float(task["result"].get("elapsed") or 0)
+            ended = started + elapsed
+            if started > 0 and ended > started:
+                try:
+                    snap = await prom_snapshot.fetch_snapshot(url, started, ended)
+                    if snap.get("series"):
+                        return {"success": True, "source": "live", "metrics": snap}
+                except Exception:
+                    pass  # 实时查询失败：走空数据兜底
+    # 3. 无监控数据
+    return {"success": True, "source": None, "metrics": None}
+
+
+@app.get("/api/tests/image/history/{task_name}/analysis")
+def api_image_history_analysis(task_name: str):
+    """读取持久化的 AI 分析结论（无则 analysis 为 null）。"""
+    return {
+        "success": True,
+        "analysis": analysis.load_analysis(task_name),
+        "pending": analysis.is_pending(task_name),
+    }
+
+
+# ==================== 视频测试 API ====================
+# 与图形测试同构：视频理解 + 文章生成（多模态 video_url 消息）
+
+class VideoTestPayload(BaseModel):
+    model_id: str
+    video_dir: str
+    video_count: int = 5
+    article_length: int = 500
+    concurrency: int = 2
+
+
+@app.post("/api/tests/video/start")
+async def api_video_start(payload: VideoTestPayload):
+    video_dir = payload.video_dir.strip()
+    if not video_dir:
+        return JSONResponse({"success": False, "error": "请先选择视频目录"}, 400)
+    if payload.video_count < 1 or payload.video_count > 100:
+        return JSONResponse({"success": False, "error": "迭代次数需在 1-100 之间"}, 400)
+    if payload.article_length < 10 or payload.article_length > 10000:
+        return JSONResponse({"success": False, "error": "输出长度需在 10-10000 token 之间"}, 400)
+    if payload.concurrency < 1 or payload.concurrency > 1000:
+        return JSONResponse({"success": False, "error": "并发度需在 1-1000 之间"}, 400)
+    # 启动时刻快照模型服务端参数（报告 Profile 数据源；探测失败不阻塞启动）
+    probe = await _probe_model_cached(payload.model_id)
+    return video_engine.start(payload.model_id, video_dir,
+                              payload.video_count, payload.article_length,
+                              payload.concurrency, probe=probe)
+
+
+@app.get("/api/tests/video/status")
+def api_video_status():
+    return video_engine.status_dict()
+
+
+@app.get("/api/tests/video/case/{case_id}")
+def api_video_case_detail(case_id: int):
+    """单个 case 详情（含调用历史与端到端性能指标），供详情弹窗轮询。"""
+    detail = video_engine.case_detail(case_id)
+    if detail is None:
+        return JSONResponse({"success": False, "error": "case 不存在"}, 404)
+    return {
+        "success": True,
+        "case": detail,
+        "test_status": video_engine.status,
+    }
+
+
+@app.get("/api/tests/video/case/{case_id}/stream")
+async def api_video_case_stream(case_id: int):
+    return await _case_stream_response(video_engine, case_id)
+
+
+@app.post("/api/tests/video/stop")
+async def api_video_stop():
+    return video_engine.stop()
+
+
+@app.get("/api/tests/video/history")
+def api_video_history():
+    """历史视频测试任务列表（按开始时间倒序）。"""
+    return {"success": True, "tasks": workspace.list_history("视频测试")}
+
+
+@app.get("/api/tests/video/history/{task_name}")
+def api_video_history_detail(task_name: str):
+    """单个历史任务的完整配置与结果（报告模式数据源）。"""
+    task = workspace.load_task(task_name)
+    if task is None:
+        return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    return {"success": True, "config": task["config"], "result": task["result"]}
+
+
+@app.delete("/api/tests/video/history/{task_name}")
+def api_video_history_delete(task_name: str):
+    """删除历史任务：整体移除 workspace/<任务名>/ 目录（含结果与监控快照）。"""
+    # 运行中的任务禁止删除（目录正被引擎写入）
+    if (video_engine.task_name == task_name
+            and video_engine.status in ("running", "stopping")):
+        return JSONResponse({"success": False, "error": "任务运行中，无法删除"}, 409)
+    try:
+        ok = workspace.delete_task(task_name)
+    except OSError as e:
+        return JSONResponse({"success": False, "error": f"删除失败：{e}"}, 500)
+    if not ok:
+        return JSONResponse({"success": False, "error": "任务不存在"}, 404)
+    applog.log("test", f"删除历史视频测试任务 {task_name}")
+    return {"success": True}
+
+
+@app.get("/api/tests/video/history/{task_name}/metrics")
+async def api_video_history_metrics(task_name: str):
+    """报告模式监控数据。三级回退：快照 → 实时查询 → 空。"""
+    # 1. 快照优先（测试结束时存档，不受 TSDB 保留期限制）
+    snap = prom_snapshot.load_metrics(task_name)
+    if snap:
+        return {"success": True, "source": "snapshot", "metrics": snap}
+    # 2. 无快照但有 Prometheus 配置：按任务起止时间实时查询（15 天内有效）
+    url = model_store.get_prometheus_config().get("url", "")
+    if url:
+        task = workspace.load_task(task_name)
+        if task:
+            started = float(task["config"].get("started_at") or 0)
+            elapsed = float(task["result"].get("elapsed") or 0)
+            ended = started + elapsed
+            if started > 0 and ended > started:
+                try:
+                    snap = await prom_snapshot.fetch_snapshot(url, started, ended)
+                    if snap.get("series"):
+                        return {"success": True, "source": "live", "metrics": snap}
+                except Exception:
+                    pass  # 实时查询失败：走空数据兜底
+    # 3. 无监控数据
+    return {"success": True, "source": None, "metrics": None}
+
+
+@app.get("/api/tests/video/history/{task_name}/analysis")
+def api_video_history_analysis(task_name: str):
+    """读取持久化的 AI 分析结论（无则 analysis 为 null）。"""
+    return {
+        "success": True,
+        "analysis": analysis.load_analysis(task_name),
+        "pending": analysis.is_pending(task_name),
+    }
+
+
+# ==================== 图片目录浏览 API ====================
+# 浏览的是应用部署机器的磁盘（内网工具，从磁盘根开始，无安全限制）
+
+@app.get("/api/fs/defaults")
+def api_fs_defaults():
+    """默认素材目录：程序运行位置下的 image/ 与 video/。
+
+    供前端页面加载时预填目录参数（含文件计数）；目录不存在时对应字段为 null。
+    """
+    from ._paths import data_root
+    from .image_engine import scan_image_dir
+    from .video_engine import scan_video_dir
+
+    def info(name, scanner):
+        d = os.path.join(data_root(), name)
+        if not os.path.isdir(d):
+            return None
+        try:
+            count = len(scanner(d))
+        except OSError:
+            count = 0
+        return {"path": d, "count": count}
+
+    return {
+        "success": True,
+        "image_dir": info("image", scan_image_dir),
+        "video_dir": info("video", scan_video_dir),
+    }
+
+
+@app.get("/api/fs/root")
+def api_fs_root():
+    """列出浏览起点：Windows 全部盘符 / Unix 根目录。"""
+    if sys.platform == "win32":
+        import string
+        drives = []
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive):
+                drives.append(drive)
+        return {"success": True, "roots": drives}
+    return {"success": True, "roots": ["/"]}
+
+
+@app.get("/api/fs/list")
+def api_fs_list(path: str = ""):
+    """列出目录内容：子目录（含各自图片/视频数）+ 本目录图片/视频数。
+
+    供图片/视频目录选择弹窗：目录树导航 + 文件计数预览。
+    """
+    from .image_engine import scan_image_dir
+    from .video_engine import scan_video_dir
+    if not path:
+        return JSONResponse({"success": False, "error": "path 不能为空"}, 400)
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        return JSONResponse({"success": False, "error": f"目录不存在：{path}"}, 404)
+    dirs = []
+    images_here = 0
+    videos_here = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue  # 无权限的目录：跳过而非整体失败
+                # 子目录图片/视频计数（一级，不递归）；失败时计 -1 表示未知
+                try:
+                    n = len(scan_image_dir(entry.path))
+                    v = len(scan_video_dir(entry.path))
+                except OSError:
+                    n = v = -1
+                dirs.append({"name": entry.name, "path": entry.path,
+                             "images": n, "videos": v})
+        dirs.sort(key=lambda d: d["name"].lower())
+        images_here = len(scan_image_dir(path))
+        videos_here = len(scan_video_dir(path))
+    except OSError as e:
+        return JSONResponse({"success": False, "error": f"无法读取目录：{e}"}, 500)
+    parent = os.path.dirname(path.rstrip("\\/")) or None
+    # Windows 盘根（如 C:\）的 parent 置空 → 前端显示"返回盘符列表"
+    if sys.platform == "win32" and len(path.rstrip("\\")) <= 2:
+        parent = None
+    return {
+        "success": True,
+        "path": path,
+        "parent": parent,
+        "dirs": dirs,
+        "images": images_here,
+        "videos": videos_here,
     }
 
 

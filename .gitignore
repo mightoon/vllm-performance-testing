@@ -3,3 +3,5 @@ workspace
 build
 dist
 logs
+image
+video

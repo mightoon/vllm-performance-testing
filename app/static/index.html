@@ -145,21 +145,239 @@
     </div>
   </section>
 
-  <!-- ============ 图形测试 Tab（占位） ============ -->
+  <!-- ============ 图形测试 Tab ============ -->
   <section class="tab-panel" id="panel-image">
-    <div class="placeholder-card">
-      <div class="placeholder-icon">🖼️</div>
-      <h3>图形测试</h3>
-      <p>该测试模块正在建设中，敬请期待。</p>
+    <!-- 左侧：历史测试任务列表 -->
+    <aside class="history-sidebar">
+      <div class="history-header">
+        <span class="history-title">历史测试</span>
+        <button class="btn-new-test" id="btnNewImageTest" title="新建测试任务">＋ 新测试</button>
+      </div>
+      <div class="history-list" id="imgHistoryList">
+        <div class="history-empty">暂无历史测试</div>
+      </div>
+    </aside>
+
+    <!-- 右侧：参数与运行状态（与文本测试同构） -->
+    <div class="tab-main">
+    <div class="param-card">
+      <h3>测试场景</h3>
+      <div class="param-grid">
+        <!-- 第一行：模型配置（占 1/4 宽）+ 服务端参数探测（占余下 3/4） -->
+        <div class="param-row">
+          <div class="param-item">
+            <label>模型配置</label>
+            <select id="imgModelSelect"></select>
+          </div>
+          <div class="model-info" id="imgModelInfo" style="display:none"></div>
+        </div>
+        <!-- 第二行：测试图片 / 迭代次数 / 输出长度 / 并发度 -->
+        <div class="param-row">
+          <div class="param-item image-dir-item">
+            <label>测试图片</label>
+            <div class="image-dir-control">
+              <button type="button" class="btn-pick-dir" id="btnPickImageDir">图片目录</button>
+              <div class="image-dir-label" id="imageDirLabel" title="">未选择目录</div>
+            </div>
+          </div>
+          <div class="param-item">
+            <label>迭代次数（每Thread）</label>
+            <input type="number" id="imageCount" value="5" min="1" max="100">
+          </div>
+          <div class="param-item">
+            <label>输出长度（token）</label>
+            <input type="number" id="imgArticleLength" value="500" min="10" max="10000" step="10">
+          </div>
+          <div class="param-item">
+            <label>并发度（并行 Thread 数）</label>
+            <input type="number" id="imgConcurrency" value="2" min="1" max="1000">
+          </div>
+        </div>
+      </div>
+      <div class="param-actions">
+        <button class="btn-primary" id="btnRunImage">▶ 运行测试</button>
+        <button class="btn-danger" id="btnStopImage" disabled>■ 停止</button>
+      </div>
+    </div>
+
+    <!-- ============ 测试运行显示区域（隶属于图形测试 tab） ============ -->
+    <section class="run-area" id="imgRunArea">
+      <div class="run-area-header">
+        <div class="run-area-title-group">
+          <h3 id="imgRunPanelTitle">测试状态</h3>
+          <button class="btn-report" id="btnImgGenReport" style="display:none">📊 生成报告</button>
+          <button class="btn-report" id="btnImgBackStatus" style="display:none">📈 测试状态</button>
+        </div>
+        <div class="refresh-control">
+          <label>刷新间隔</label>
+          <select id="imgRefreshInterval">
+            <option value="1">1 秒</option>
+            <option value="3" selected>3 秒</option>
+            <option value="5">5 秒</option>
+            <option value="10">10 秒</option>
+            <option value="30">30 秒</option>
+          </select>
+        </div>
+      </div>
+      <div class="run-summary" id="imgRunSummary" style="display:none">
+        <span id="imgSumStatus"></span>
+        <span id="imgSumElapsed"></span>
+        <span id="imgSumCalls"></span>
+        <span id="imgSumErrors"></span>
+        <span id="imgSumChars"></span>
+        <span id="imgSumTokens"></span>
+      </div>
+      <!-- 测试 Profile（仅报告模式显示） -->
+      <div class="vllm-bar profile-bar" id="imgProfileBar" style="display:none">
+        <div class="vllm-bar-title">Profile</div>
+        <div class="detail-grid vllm-grid" id="imgProfileBarItems"></div>
+      </div>
+      <!-- 服务端指标条 -->
+      <div class="vllm-bar" id="imgVllmBar" style="display:none">
+        <div class="vllm-bar-title" id="imgVllmBarTitle">Metrics</div>
+        <div id="imgVllmBarItems"></div>
+      </div>
+      <div class="progress-list" id="imgProgressList">
+        <div class="run-empty" id="imgRunEmpty">暂无运行中的测试</div>
+      </div>
+    </section>
+
+    <!-- ============ AI 分析（仅报告模式显示） ============ -->
+    <section class="run-area analysis-area" id="imgAnalysisArea" style="display:none">
+      <div class="run-area-header">
+        <h3>Analysis <span class="monitor-source" id="imgAnalysisMeta"></span></h3>
+      </div>
+      <div class="analysis-body" id="imgAnalysisBody"></div>
+    </section>
+
+    <!-- ============ 监控指标（仅报告模式显示） ============ -->
+    <section class="run-area monitor-area" id="imgMonitorArea" style="display:none">
+      <div class="run-area-header">
+        <h3>Charts <span class="monitor-source" id="imgMonitorSource"></span></h3>
+        <a href="javascript:void(0)" class="grafana-link" id="imgGrafanaLink" style="display:none" target="_blank">在 Grafana 中查看 ↗</a>
+      </div>
+      <div class="monitor-cards" id="imgMonitorCards"></div>
+      <div class="monitor-charts" id="imgMonitorCharts"></div>
+      <div class="monitor-empty" id="imgMonitorEmpty" style="display:none">无监控数据（未配置 Prometheus 或该时间段数据已过期）</div>
+    </section>
     </div>
   </section>
 
-  <!-- ============ 视频测试 Tab（占位） ============ -->
+  <!-- ============ 视频测试 Tab（与图形测试同构） ============ -->
   <section class="tab-panel" id="panel-video">
-    <div class="placeholder-card">
-      <div class="placeholder-icon">🎬</div>
-      <h3>视频测试</h3>
-      <p>该测试模块正在建设中，敬请期待。</p>
+    <!-- 左侧：历史测试任务列表 -->
+    <aside class="history-sidebar">
+      <div class="history-header">
+        <span class="history-title">历史测试</span>
+        <button class="btn-new-test" id="btnNewVideoTest" title="新建测试任务">＋ 新测试</button>
+      </div>
+      <div class="history-list" id="vidHistoryList">
+        <div class="history-empty">暂无历史测试</div>
+      </div>
+    </aside>
+
+    <!-- 右侧：参数与运行状态（与图形测试同构） -->
+    <div class="tab-main">
+    <div class="param-card">
+      <h3>测试场景</h3>
+      <div class="param-grid">
+        <!-- 第一行：模型配置（占 1/4 宽）+ 服务端参数探测（占余下 3/4） -->
+        <div class="param-row">
+          <div class="param-item">
+            <label>模型配置</label>
+            <select id="vidModelSelect"></select>
+          </div>
+          <div class="model-info" id="vidModelInfo" style="display:none"></div>
+        </div>
+        <!-- 第二行：测试视频 / 迭代次数 / 输出长度 / 并发度 -->
+        <div class="param-row">
+          <div class="param-item image-dir-item">
+            <label>测试视频</label>
+            <div class="image-dir-control">
+              <button type="button" class="btn-pick-dir" id="btnPickVideoDir">视频目录</button>
+              <div class="image-dir-label" id="videoDirLabel" title="">未选择目录</div>
+            </div>
+          </div>
+          <div class="param-item">
+            <label>迭代次数（每Thread）</label>
+            <input type="number" id="videoCount" value="5" min="1" max="100">
+          </div>
+          <div class="param-item">
+            <label>输出长度（token）</label>
+            <input type="number" id="vidArticleLength" value="500" min="10" max="10000" step="10">
+          </div>
+          <div class="param-item">
+            <label>并发度（并行 Thread 数）</label>
+            <input type="number" id="vidConcurrency" value="2" min="1" max="1000">
+          </div>
+        </div>
+      </div>
+      <div class="param-actions">
+        <button class="btn-primary" id="btnRunVideo">▶ 运行测试</button>
+        <button class="btn-danger" id="btnStopVideo" disabled>■ 停止</button>
+      </div>
+    </div>
+
+    <!-- ============ 测试运行显示区域（隶属于视频测试 tab） ============ -->
+    <section class="run-area" id="vidRunArea">
+      <div class="run-area-header">
+        <div class="run-area-title-group">
+          <h3 id="vidRunPanelTitle">测试状态</h3>
+          <button class="btn-report" id="btnVidGenReport" style="display:none">📊 生成报告</button>
+          <button class="btn-report" id="btnVidBackStatus" style="display:none">📈 测试状态</button>
+        </div>
+        <div class="refresh-control">
+          <label>刷新间隔</label>
+          <select id="vidRefreshInterval">
+            <option value="1">1 秒</option>
+            <option value="3" selected>3 秒</option>
+            <option value="5">5 秒</option>
+            <option value="10">10 秒</option>
+            <option value="30">30 秒</option>
+          </select>
+        </div>
+      </div>
+      <div class="run-summary" id="vidRunSummary" style="display:none">
+        <span id="vidSumStatus"></span>
+        <span id="vidSumElapsed"></span>
+        <span id="vidSumCalls"></span>
+        <span id="vidSumErrors"></span>
+        <span id="vidSumChars"></span>
+        <span id="vidSumTokens"></span>
+      </div>
+      <!-- 测试 Profile（仅报告模式显示） -->
+      <div class="vllm-bar profile-bar" id="vidProfileBar" style="display:none">
+        <div class="vllm-bar-title">Profile</div>
+        <div class="detail-grid vllm-grid" id="vidProfileBarItems"></div>
+      </div>
+      <!-- 服务端指标条 -->
+      <div class="vllm-bar" id="vidVllmBar" style="display:none">
+        <div class="vllm-bar-title" id="vidVllmBarTitle">Metrics</div>
+        <div id="vidVllmBarItems"></div>
+      </div>
+      <div class="progress-list" id="vidProgressList">
+        <div class="run-empty" id="vidRunEmpty">暂无运行中的测试</div>
+      </div>
+    </section>
+
+    <!-- ============ AI 分析（仅报告模式显示） ============ -->
+    <section class="run-area analysis-area" id="vidAnalysisArea" style="display:none">
+      <div class="run-area-header">
+        <h3>Analysis <span class="monitor-source" id="vidAnalysisMeta"></span></h3>
+      </div>
+      <div class="analysis-body" id="vidAnalysisBody"></div>
+    </section>
+
+    <!-- ============ 监控指标（仅报告模式显示） ============ -->
+    <section class="run-area monitor-area" id="vidMonitorArea" style="display:none">
+      <div class="run-area-header">
+        <h3>Charts <span class="monitor-source" id="vidMonitorSource"></span></h3>
+        <a href="javascript:void(0)" class="grafana-link" id="vidGrafanaLink" style="display:none" target="_blank">在 Grafana 中查看 ↗</a>
+      </div>
+      <div class="monitor-cards" id="vidMonitorCards"></div>
+      <div class="monitor-charts" id="vidMonitorCharts"></div>
+      <div class="monitor-empty" id="vidMonitorEmpty" style="display:none">无监控数据（未配置 Prometheus 或该时间段数据已过期）</div>
+    </section>
     </div>
   </section>
 
@@ -281,8 +499,116 @@
   </div>
 </div>
 
+<!-- ============ 图形测试 Case 详情弹窗 ============ -->
+<div class="modal-overlay" id="imgCaseModal" style="display:none">
+  <div class="modal case-detail-card">
+    <div class="modal-header">
+      <h3 id="imgCaseDetailTitle">Thread 详情</h3>
+      <span class="case-status" id="imgCaseDetailBadge"></span>
+      <button class="btn-close" id="btnCloseImgCase">✕</button>
+    </div>
+    <div class="case-detail-body">
+      <div class="detail-section">
+        <h4>运行数据</h4>
+        <div class="detail-grid" id="imgCaseRunStats"></div>
+      </div>
+      <div class="detail-section">
+        <h4>端到端性能 <span class="detail-hint">（客户端测量 · 仅统计流式文章调用 · 10s 刷新）</span></h4>
+        <div class="detail-grid" id="imgCaseE2eMetrics"></div>
+      </div>
+      <div class="detail-section">
+        <a href="javascript:void(0)" class="detail-toggle" id="btnImgMoreDetail">更多细节 ▸</a>
+        <div class="qa-layout" id="imgCaseQaWrap" style="display:none">
+          <div class="qa-outline" id="imgCaseQaOutline"></div>
+          <div class="qa-list" id="imgCaseQaList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 图片目录选择弹窗 ============ -->
+<div class="modal-overlay" id="imageDirModal" style="display:none">
+  <div class="modal dir-picker-card">
+    <div class="modal-header">
+      <h3>选择图片目录</h3>
+      <button class="btn-close" id="btnCloseImgDir">✕</button>
+    </div>
+    <div class="dir-picker-body">
+      <div class="dir-nav">
+        <button type="button" class="btn-dir-up" id="btnImgDirUp" title="返回上级">↑ 上级</button>
+        <div class="dir-path" id="imgDirPath" title="">请选择位置</div>
+      </div>
+      <div class="dir-list" id="imgDirList">
+        <div class="dir-empty">加载中…</div>
+      </div>
+      <div class="dir-picker-footer">
+        <div class="dir-images-info" id="imgDirImagesInfo"></div>
+        <div class="form-actions">
+          <button type="button" class="btn-primary" id="btnImgDirConfirm" disabled>选择此目录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 视频测试 Case 详情弹窗 ============ -->
+<div class="modal-overlay" id="vidCaseModal" style="display:none">
+  <div class="modal case-detail-card">
+    <div class="modal-header">
+      <h3 id="vidCaseDetailTitle">Thread 详情</h3>
+      <span class="case-status" id="vidCaseDetailBadge"></span>
+      <button class="btn-close" id="btnCloseVidCase">✕</button>
+    </div>
+    <div class="case-detail-body">
+      <div class="detail-section">
+        <h4>运行数据</h4>
+        <div class="detail-grid" id="vidCaseRunStats"></div>
+      </div>
+      <div class="detail-section">
+        <h4>端到端性能 <span class="detail-hint">（客户端测量 · 仅统计流式文章调用 · 10s 刷新）</span></h4>
+        <div class="detail-grid" id="vidCaseE2eMetrics"></div>
+      </div>
+      <div class="detail-section">
+        <a href="javascript:void(0)" class="detail-toggle" id="btnVidMoreDetail">更多细节 ▸</a>
+        <div class="qa-layout" id="vidCaseQaWrap" style="display:none">
+          <div class="qa-outline" id="vidCaseQaOutline"></div>
+          <div class="qa-list" id="vidCaseQaList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 视频目录选择弹窗 ============ -->
+<div class="modal-overlay" id="videoDirModal" style="display:none">
+  <div class="modal dir-picker-card">
+    <div class="modal-header">
+      <h3>选择视频目录</h3>
+      <button class="btn-close" id="btnCloseVidDir">✕</button>
+    </div>
+    <div class="dir-picker-body">
+      <div class="dir-nav">
+        <button type="button" class="btn-dir-up" id="btnVidDirUp" title="返回上级">↑ 上级</button>
+        <div class="dir-path" id="vidDirPath" title="">请选择位置</div>
+      </div>
+      <div class="dir-list" id="vidDirList">
+        <div class="dir-empty">加载中…</div>
+      </div>
+      <div class="dir-picker-footer">
+        <div class="dir-images-info" id="vidDirVideosInfo"></div>
+        <div class="form-actions">
+          <button type="button" class="btn-primary" id="btnVidDirConfirm" disabled>选择此目录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="/marked.min.js"></script>
 <script src="/echarts.min.js"></script>
 <script src="/app.js"></script>
+<script src="/image_test.js"></script>
+<script src="/video_test.js"></script>
 </body>
 </html>
